@@ -1,0 +1,20 @@
+{
+  "name": "pokemon-center-buyer",
+  "version": "1.0.0",
+  "description": "Automated buyer for Pokemon Center SG on Lazada",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "watch": "tsc -w"
+  },
+  "dependencies": {
+    "playwright": "^1.56.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.18",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

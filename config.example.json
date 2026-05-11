@@ -1,0 +1,27 @@
+{
+  "credentials": {
+    "email": "your@email.com",
+    "password": "yourpassword"
+  },
+  "items": [
+    {
+      "url": "https://www.lazada.sg/products/pokemon-center-sg-example-item-i123456789.html",
+      "name": "Pokemon Center SG - Example Item",
+      "maxPrice": 59.90,
+      "quantity": 1
+    },
+    {
+      "url": "https://www.lazada.sg/products/another-pokemon-item-i987654321.html",
+      "name": "Pokemon Center SG - Another Item",
+      "maxPrice": 39.90,
+      "quantity": 2
+    }
+  ],
+  "settings": {
+    "checkIntervalMs": 10000,
+    "headless": false,
+    "maxRetries": 3,
+    "paymentMethod": "credit_card",
+    "sessionFile": "session.json"
+  }
+}
