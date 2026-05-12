@@ -1,109 +1,211 @@
+/**
+ * Stock monitor.
+ *
+ * Polls a product page on a configured interval.
+ * Applies rate limiting before every page load.
+ * Returns typed StockCheckResult — never throws on page errors,
+ * instead returns status "unknown" so the caller can decide to retry.
+ * Halts (returns "anti_bot") if a bot challenge is detected.
+ */
+
 import { Page } from "playwright";
-import { Item, CheckResult, StockStatus } from "./types";
+import { Item, StockCheckResult } from "./types";
+import { Logger } from "./logger";
+import { RateLimiter } from "./rate-limiter";
+import { SELECTORS } from "./selectors";
+import { resolveSelector } from "./selectors";
+import { detectChallenge } from "./auth";
+import { navigateTo } from "./browser-actions";
 
-// Selectors based on Lazada SG product page structure (update if Lazada redesigns)
-const SELECTORS = {
-  // Price element on product detail page
-  price: '[class*="pdp-price"], [class*="price-container"] [class*="price"]',
-  // Add to Cart button (enabled = in stock)
-  addToCart: 'button[data-spm-click*="cart"], button:has-text("Add to Cart")',
-  // Buy Now button (faster path to checkout)
-  buyNow: 'button[data-spm-click*="buynow"], button:has-text("Buy Now")',
-  // Out-of-stock indicators
-  outOfStock: 'button:has-text("Sold Out"), button:has-text("Out of Stock"), button:has-text("Notify Me")',
-};
+const MODULE = "monitor";
+const LAZADA_DOMAIN = "www.lazada.sg";
 
-export async function checkStock(page: Page, item: Item): Promise<CheckResult> {
-  try {
-    await page.goto(item.url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(1500); // allow dynamic content to settle
-  } catch (err) {
-    console.error(`[monitor] Failed to load page for "${item.name}":`, err);
-    return { status: "unknown", price: null, itemName: item.name };
-  }
+// ---------------------------------------------------------------------------
+// Single stock check
+// ---------------------------------------------------------------------------
 
-  const price = await extractPrice(page);
-  const status = await determineStockStatus(page, item, price);
-
-  return { status, price, itemName: item.name };
-}
-
-async function extractPrice(page: Page): Promise<number | null> {
-  try {
-    const el = page.locator(SELECTORS.price).first();
-    const text = await el.textContent({ timeout: 5000 });
-    if (!text) return null;
-    // Parse "$XX.XX" or "S$XX.XX"
-    const match = text.match(/[\d,]+\.?\d*/);
-    return match ? parseFloat(match[0].replace(",", "")) : null;
-  } catch {
-    return null;
-  }
-}
-
-async function determineStockStatus(
+export async function checkStock(
   page: Page,
   item: Item,
-  price: number | null
-): Promise<StockStatus> {
-  // Check for explicit out-of-stock markers first
-  const soldOutVisible = await page
-    .locator(SELECTORS.outOfStock)
-    .first()
-    .isVisible({ timeout: 2000 })
-    .catch(() => false);
+  rateLimiter: RateLimiter,
+  logger: Logger
+): Promise<StockCheckResult> {
+  const timestamp = new Date().toISOString();
+  const base: Omit<StockCheckResult, "status" | "price" | "pageTitle"> = {
+    itemName: item.name,
+    url: item.url,
+    timestamp,
+  };
 
-  if (soldOutVisible) return "out_of_stock";
+  // Enforce rate limit before every page load
+  await rateLimiter.acquire(LAZADA_DOMAIN);
 
-  const buyNowVisible = await page
-    .locator(SELECTORS.buyNow)
-    .first()
-    .isVisible({ timeout: 2000 })
-    .catch(() => false);
-
-  const addToCartVisible = await page
-    .locator(SELECTORS.addToCart)
-    .first()
-    .isVisible({ timeout: 2000 })
-    .catch(() => false);
-
-  if (!buyNowVisible && !addToCartVisible) return "unknown";
-
-  // Enforce max price guard
-  if (price !== null && price > item.maxPrice) {
-    console.log(
-      `[monitor] "${item.name}" is available at $${price} but exceeds maxPrice $${item.maxPrice}. Skipping.`
-    );
-    return "out_of_stock"; // treat as skip-worthy
+  try {
+    await navigateTo(page, item.url, logger);
+  } catch (err) {
+    logger.warn(MODULE, "navigation_failed", {
+      item: item.name,
+      error: (err as Error).message,
+    });
+    return { ...base, status: "unknown", price: null, pageTitle: null };
   }
 
-  return "available";
+  // Brief pause for dynamic JS content to settle
+  await page.waitForTimeout(1_500);
+
+  const pageTitle = await page.title().catch(() => null);
+
+  // Challenge detection takes priority over everything else
+  const challenge = await detectChallenge(page, logger);
+  if (challenge) {
+    logger.error(MODULE, "anti_bot_halting", {
+      item: item.name,
+      challengeType: challenge.type,
+      url: challenge.url,
+    });
+    return { ...base, status: "anti_bot", price: null, pageTitle };
+  }
+
+  // Check for login-required state (e.g. session expired mid-run)
+  if (page.url().includes("/login")) {
+    logger.warn(MODULE, "login_required", { item: item.name });
+    return { ...base, status: "login_required", price: null, pageTitle };
+  }
+
+  const price = await extractPrice(page, item.name, logger);
+  const status = await determineStatus(page, item.name, logger);
+
+  logger.info(MODULE, "stock_check", {
+    item: item.name,
+    status,
+    price,
+  });
+
+  return { ...base, status, price, pageTitle };
 }
+
+// ---------------------------------------------------------------------------
+// Polling loop
+// ---------------------------------------------------------------------------
 
 export async function waitForStock(
   page: Page,
   item: Item,
   intervalMs: number,
-  signal: { stop: boolean }
-): Promise<CheckResult> {
-  console.log(`[monitor] Watching "${item.name}" every ${intervalMs / 1000}s...`);
+  rateLimiter: RateLimiter,
+  logger: Logger,
+  signal: AbortSignal
+): Promise<StockCheckResult> {
+  logger.info(MODULE, "monitoring_started", {
+    item: item.name,
+    intervalMs,
+    maxPrice: item.maxPrice,
+  });
 
-  while (!signal.stop) {
-    const result = await checkStock(page, item);
+  while (!signal.aborted) {
+    const result = await checkStock(page, item, rateLimiter, logger);
 
-    if (result.status === "available") {
-      console.log(`[monitor] "${item.name}" is IN STOCK at $${result.price}!`);
+    if (result.status === "anti_bot") {
+      logger.error(MODULE, "monitoring_halted_anti_bot", { item: item.name });
+      return result; // caller inspects status and handles accordingly
+    }
+
+    if (result.status === "login_required") {
+      logger.error(MODULE, "monitoring_halted_login_expired", { item: item.name });
       return result;
     }
 
-    if (result.status === "out_of_stock") {
-      console.log(`[monitor] "${item.name}" not available. Checking again in ${intervalMs / 1000}s...`);
-    } else {
-      console.warn(`[monitor] Unknown status for "${item.name}". Retrying...`);
+    if (result.status === "in_stock") {
+      logger.info(MODULE, "item_available", { item: item.name, price: result.price });
+      return result;
     }
 
-    await page.waitForTimeout(intervalMs);
+    logger.debug(MODULE, "not_available_sleeping", {
+      item: item.name,
+      status: result.status,
+      nextCheckMs: intervalMs,
+    });
+
+    // Interruptible sleep: check signal every 500ms
+    await interruptibleSleep(intervalMs, signal);
   }
 
-  throw new Error(`[monitor] Stopped watching "${item.name}".`);
+  logger.info(MODULE, "monitoring_aborted", { item: item.name });
+  return {
+    status: "unknown",
+    price: null,
+    itemName: item.name,
+    pageTitle: null,
+    url: item.url,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+async function extractPrice(
+  page: Page,
+  itemName: string,
+  logger: Logger
+): Promise<number | null> {
+  const resolved = await resolveSelector(page, SELECTORS.product.price, 3_000).catch(
+    () => null
+  );
+  if (!resolved) return null;
+
+  const text = await page
+    .locator(resolved.selector)
+    .first()
+    .textContent()
+    .catch(() => null);
+
+  if (!text) return null;
+
+  // Match numeric price like "39.90", "1,299.00"
+  const match = text.match(/[\d,]+\.?\d*/);
+  if (!match) return null;
+
+  const price = parseFloat(match[0].replace(",", ""));
+  logger.debug(MODULE, "price_extracted", { itemName, rawText: text.trim(), price });
+  return isNaN(price) ? null : price;
+}
+
+async function determineStatus(
+  page: Page,
+  itemName: string,
+  logger: Logger
+): Promise<StockCheckResult["status"]> {
+  // Out-of-stock markers take precedence
+  const oos = await resolveSelector(page, SELECTORS.product.outOfStockIndicator, 2_000).catch(
+    () => null
+  );
+  if (oos) {
+    logger.debug(MODULE, "oos_indicator_found", { itemName, selector: oos.selector });
+    return "out_of_stock";
+  }
+
+  // Buy Now is the strongest positive signal
+  const buyNow = await resolveSelector(page, SELECTORS.product.buyNowButton, 2_000).catch(
+    () => null
+  );
+  if (buyNow) return "in_stock";
+
+  // Add to Cart is also a positive signal
+  const addToCart = await resolveSelector(page, SELECTORS.product.addToCartButton, 2_000).catch(
+    () => null
+  );
+  if (addToCart) return "in_stock";
+
+  return "unknown";
+}
+
+async function interruptibleSleep(ms: number, signal: AbortSignal): Promise<void> {
+  const step = 500;
+  let elapsed = 0;
+  while (elapsed < ms && !signal.aborted) {
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(step, ms - elapsed)));
+    elapsed += step;
+  }
 }

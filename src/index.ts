@@ -1,75 +1,192 @@
-import { chromium, BrowserContext, Page } from "playwright";
-import * as fs from "fs";
+/**
+ * Entry point.
+ *
+ * Lifecycle:
+ *   1. Load and validate config + env-var credentials
+ *   2. Launch browser, restore session, verify login
+ *   3. Start one monitor+checkout worker per configured item
+ *   4. Shut down gracefully on SIGINT/SIGTERM
+ *
+ * Promise.allSettled is used so a failure on one item does not abort others.
+ */
+
+import { chromium, BrowserContext } from "playwright";
 import * as path from "path";
-import { Config, Item } from "./types";
-import { login, loadSession, saveSession, isLoggedIn } from "./auth";
+import * as fs from "fs";
+import { loadConfig, loadCredentials } from "./config";
+import { Logger } from "./logger";
+import { RateLimiter } from "./rate-limiter";
+import { loadSession, login, saveSession, isLoggedIn, ChallengeDetectedError } from "./auth";
 import { waitForStock } from "./monitor";
-import { buyItem } from "./checkout";
+import { shouldProceed, isAntiBot, computeBackoff, formatOrderSummary } from "./decision";
+import { checkout } from "./checkout";
+import { Item, Config, StockCheckResult } from "./types";
 
-const CONFIG_PATH = path.join(process.cwd(), "config.json");
+// ---------------------------------------------------------------------------
+// CLI flags
+// ---------------------------------------------------------------------------
 
-function loadConfig(): Config {
-  if (!fs.existsSync(CONFIG_PATH)) {
-    console.error(`[main] config.json not found at ${CONFIG_PATH}`);
-    console.error("[main] Copy config.example.json to config.json and fill in your details.");
-    process.exit(1);
-  }
-  return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")) as Config;
-}
+const args = process.argv.slice(2);
+const CLI_DRY_RUN = args.includes("--dry-run");
+const CLI_VERIFY_SELECTORS = args.includes("--verify-selectors");
 
-async function processItem(
-  context: BrowserContext,
+// ---------------------------------------------------------------------------
+// Per-item worker
+// ---------------------------------------------------------------------------
+
+async function runItemWorker(
   item: Item,
-  config: Config
+  config: Config,
+  context: BrowserContext,
+  rateLimiter: RateLimiter,
+  logger: Logger,
+  signal: AbortSignal
 ): Promise<void> {
-  const page: Page = await context.newPage();
+  const page = await context.newPage();
 
   try {
-    const signal = { stop: false };
+    // Monitor until in-stock
+    const result: StockCheckResult = await waitForStock(
+      page,
+      item,
+      config.settings.checkIntervalMs,
+      rateLimiter,
+      logger,
+      signal
+    );
 
-    // Handle Ctrl+C gracefully
-    const cleanup = () => {
-      signal.stop = true;
-    };
-    process.once("SIGINT", cleanup);
-    process.once("SIGTERM", cleanup);
-
-    // Wait until stock is available
-    const result = await waitForStock(page, item, config.settings.checkIntervalMs, signal);
-
-    if (result.status !== "available") {
-      console.log(`[main] Stopped watching "${item.name}".`);
+    if (signal.aborted) {
+      logger.info("worker", "aborted_before_decision", { item: item.name });
       return;
     }
 
-    // Attempt purchase
-    const success = await buyItem(page, item, config.settings);
+    // Decision gate
+    const decision = shouldProceed(result, item, config.settings.dryRun);
 
-    if (success) {
-      console.log(`[main] Successfully purchased "${item.name}"!`);
-      // Persist updated session (auth tokens may have refreshed)
-      await saveSession(context, config.settings.sessionFile);
+    if (!decision.proceed) {
+      logger.warn("worker", "purchase_skipped", { item: item.name, reason: decision.reason });
+
+      if (isAntiBot(result.status)) {
+        logger.error("worker", "anti_bot_detected_worker_halt", { item: item.name });
+        throw new Error(`Anti-bot challenge on "${item.name}" — halting worker`);
+      }
+      return;
+    }
+
+    // Checkout
+    logger.info("worker", "starting_checkout", { item: item.name, price: result.price });
+
+    const checkoutResult = await checkout(page, item, config, rateLimiter, logger);
+
+    if (checkoutResult.success) {
+      logger.info("worker", "purchase_complete", {
+        item: item.name,
+        orderNumber: checkoutResult.orderNumber,
+      });
     } else {
-      console.error(`[main] Failed to purchase "${item.name}" after ${config.settings.maxRetries} attempts.`);
+      logger.warn("worker", "purchase_incomplete", {
+        item: item.name,
+        error: checkoutResult.error,
+      });
+    }
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Selector verification mode
+// ---------------------------------------------------------------------------
+
+async function verifySelectors(
+  context: BrowserContext,
+  config: Config,
+  logger: Logger
+): Promise<void> {
+  const { verifySelectorPage, SELECTORS } = await import("./selectors");
+  const page = await context.newPage();
+
+  try {
+    logger.info("verify", "checking_login_page_selectors");
+    await page.goto("https://www.lazada.sg/customer/account/login/", {
+      waitUntil: "domcontentloaded",
+      timeout: 20_000,
+    });
+    const loginResults = await verifySelectorPage(page, SELECTORS.login as never);
+    logger.info("verify", "login_selector_results", { results: loginResults });
+
+    const firstItem = config.items[0];
+    if (firstItem) {
+      logger.info("verify", "checking_product_page_selectors", { url: firstItem.url });
+      await page.goto(firstItem.url, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      await page.waitForTimeout(2_000);
+      const productResults = await verifySelectorPage(page, SELECTORS.product as never);
+      logger.info("verify", "product_selector_results", { results: productResults });
     }
   } finally {
     await page.close();
   }
 }
 
-async function main(): Promise<void> {
-  const config = loadConfig();
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
-  if (!config.items || config.items.length === 0) {
-    console.error("[main] No items specified in config.json.");
-    process.exit(1);
+async function main(): Promise<void> {
+  // ── Config & credentials ─────────────────────────────────────────────────
+
+  // Load .env if present (before config validation so env vars are available)
+  const envPath = path.join(process.cwd(), ".env");
+  if (fs.existsSync(envPath)) {
+    const envContent = fs.readFileSync(envPath, "utf-8");
+    for (const line of envContent.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith("#")) {
+        const eqIdx = trimmed.indexOf("=");
+        if (eqIdx > 0) {
+          const key = trimmed.slice(0, eqIdx).trim();
+          const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
+          if (!process.env[key]) {
+            process.env[key] = val;
+          }
+        }
+      }
+    }
   }
 
-  console.log(`[main] Starting Pokemon Center buyer — monitoring ${config.items.length} item(s).`);
+  const config = loadConfig();
+
+  // Override dryRun from CLI flag
+  if (CLI_DRY_RUN) {
+    config.settings.dryRun = true;
+  }
+
+  const logger = new Logger(config.settings.logDir);
+
+  logger.info("main", "startup", {
+    itemCount: config.items.length,
+    dryRun: config.settings.dryRun,
+    headless: config.settings.headless,
+    checkIntervalMs: config.settings.checkIntervalMs,
+  });
+
+  if (config.settings.dryRun) {
+    logger.warn("main", "dry_run_active", {
+      message: 'DRY RUN mode: items will be monitored but NO purchases will be made. Set "dryRun": false in config.json to enable purchases.',
+    });
+  }
+
+  // Validate credentials exist before launching browser
+  loadCredentials(); // throws if LAZADA_EMAIL or LAZADA_PASSWORD is absent
+
+  // ── Browser setup ────────────────────────────────────────────────────────
 
   const browser = await chromium.launch({
-    headless: config.settings.headless ?? false,
-    args: ["--disable-blink-features=AutomationControlled"],
+    headless: config.settings.headless,
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--no-sandbox",
+    ],
   });
 
   const context: BrowserContext = await browser.newContext({
@@ -80,33 +197,84 @@ async function main(): Promise<void> {
     timezoneId: "Asia/Singapore",
   });
 
-  // Load saved session (avoids re-login on every run)
-  const sessionLoaded = await loadSession(context, config.settings.sessionFile);
+  const controller = new AbortController();
 
-  // Verify login status using a temporary page
-  const authPage = await context.newPage();
-  const loggedIn = sessionLoaded ? await isLoggedIn(authPage) : false;
+  const shutdown = async (reason: string): Promise<void> => {
+    logger.info("main", "shutdown_initiated", { reason });
+    controller.abort();
+    await saveSession(context, config.settings.sessionFile, logger).catch(() => {});
+    await browser.close().catch(() => {});
+  };
 
-  if (!loggedIn) {
-    await login(context, authPage, config.credentials, config.settings.sessionFile);
-  } else {
-    console.log("[main] Session is valid — skipping login.");
-  }
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
-  await authPage.close();
+  // ── Authentication ───────────────────────────────────────────────────────
 
-  // Monitor all items concurrently (each gets its own page)
   try {
-    await Promise.all(
-      config.items.map((item) => processItem(context, item, config))
-    );
-  } finally {
-    console.log("[main] All items processed. Closing browser.");
-    await browser.close();
+    const authPage = await context.newPage();
+    await loadSession(context, config.settings.sessionFile, logger);
+
+    if (!(await isLoggedIn(authPage, logger))) {
+      await login(context, authPage, logger, config.settings.sessionFile);
+    } else {
+      logger.info("main", "session_valid_skipping_login");
+    }
+
+    await authPage.close();
+  } catch (err) {
+    if (err instanceof ChallengeDetectedError) {
+      logger.error("main", "login_blocked_by_challenge", { error: err.message });
+      await shutdown("challenge_during_login");
+      process.exit(1);
+    }
+    throw err;
   }
+
+  // ── Selector verification mode ───────────────────────────────────────────
+
+  if (CLI_VERIFY_SELECTORS) {
+    logger.info("main", "running_selector_verification");
+    await verifySelectors(context, config, logger);
+    await shutdown("selector_verification_complete");
+    process.exit(0);
+  }
+
+  // ── Rate limiter ─────────────────────────────────────────────────────────
+
+  const rateLimiter = new RateLimiter({
+    minIntervalMs: config.settings.minPageLoadDelayMs,
+    maxJitterMs: config.settings.maxPageLoadDelayMs - config.settings.minPageLoadDelayMs,
+  });
+
+  // ── Item workers ─────────────────────────────────────────────────────────
+
+  logger.info("main", "workers_starting", { items: config.items.map((i) => i.name) });
+
+  const workers = config.items.map((item) =>
+    runItemWorker(item, config, context, rateLimiter, logger, controller.signal)
+  );
+
+  const results = await Promise.allSettled(workers);
+
+  const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+  if (failed.length > 0) {
+    for (const f of failed) {
+      logger.error("main", "worker_failed", { error: (f.reason as Error)?.message ?? String(f.reason) });
+    }
+  }
+
+  logger.info("main", "all_workers_done", {
+    total: results.length,
+    succeeded: results.filter((r) => r.status === "fulfilled").length,
+    failed: failed.length,
+  });
+
+  await shutdown("all_workers_done");
+  process.exit(failed.length > 0 ? 1 : 0);
 }
 
 main().catch((err) => {
-  console.error("[main] Fatal error:", err);
+  process.stderr.write(`[FATAL] ${(err as Error)?.message ?? String(err)}\n`);
   process.exit(1);
 });
