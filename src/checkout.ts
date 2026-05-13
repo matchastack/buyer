@@ -124,8 +124,8 @@ async function attemptCheckout(
     const summary = await buildOrderSummary(page, item, logger);
 
     // ── User confirmation gate ─────────────────────────────────────────────
-    await requestApproval(summary, logger);
-    // ── Only executes if user types CONFIRM ───────────────────────────────
+    await requestApproval(summary, logger, config.settings);
+    // ── Only executes if user approves (CONFIRM via stdin, or Approve via Telegram) ─
 
     await clickElement(page, SELECTORS.checkout.placeOrderButton, logger);
     logger.info(MODULE, "place_order_clicked", { item: item.name });
