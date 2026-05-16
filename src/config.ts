@@ -19,6 +19,11 @@ export interface Credentials {
   password: string;
 }
 
+export interface TelegramCredentials {
+  botToken: string;
+  chatId: string;
+}
+
 export function loadCredentials(): Credentials {
   const email = process.env["LAZADA_EMAIL"]?.trim();
   const password = process.env["LAZADA_PASSWORD"]?.trim();
@@ -37,6 +42,24 @@ export function loadCredentials(): Credentials {
   return { email: email!, password: password! };
 }
 
+export function loadTelegramCredentials(): TelegramCredentials {
+  const botToken = process.env["TELEGRAM_BOT_TOKEN"]?.trim();
+  const chatId = process.env["TELEGRAM_CHAT_ID"]?.trim();
+
+  const missing: string[] = [];
+  if (!botToken) missing.push("TELEGRAM_BOT_TOKEN");
+  if (!chatId) missing.push("TELEGRAM_CHAT_ID");
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required environment variable(s) for Telegram approval: ${missing.join(", ")}.\n` +
+      'Either set them in .env, or set "approvalMethod": "stdin" in config.json.'
+    );
+  }
+
+  return { botToken: botToken!, chatId: chatId! };
+}
+
 // ---------------------------------------------------------------------------
 // Config defaults
 // ---------------------------------------------------------------------------
@@ -53,6 +76,7 @@ const DEFAULTS: Settings = {
   sessionFile: "session.json",
   dryRun: true,       // Safe default — must explicitly set false to enable purchases
   logDir: "logs",
+  approvalMethod: "stdin", // Safe default — terminal-based approval
 };
 
 // ---------------------------------------------------------------------------
@@ -131,6 +155,11 @@ function validateSettings(raw: Record<string, unknown>): Settings {
   }
   if (typeof merged.dryRun !== "boolean") {
     throw new ConfigValidationError("settings.dryRun must be a boolean");
+  }
+  if (merged.approvalMethod !== "stdin" && merged.approvalMethod !== "telegram") {
+    throw new ConfigValidationError(
+      'settings.approvalMethod must be "stdin" or "telegram"'
+    );
   }
 
   return merged;

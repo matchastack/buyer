@@ -21,6 +21,8 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export type PaymentMethodKey = "credit_card" | "cod" | "paynow" | string;
 
+export type ApprovalMethod = "stdin" | "telegram";
+
 // ---------------------------------------------------------------------------
 // Configuration (loaded from config.json; credentials come from env vars)
 // ---------------------------------------------------------------------------
@@ -44,6 +46,7 @@ export interface Settings {
   sessionFile: string;           // Path for persisted browser cookies
   dryRun: boolean;               // true = monitor only, NEVER purchase
   logDir: string;                // Directory for audit log files
+  approvalMethod: ApprovalMethod; // How to gate purchases: terminal stdin or Telegram bot
 }
 
 export interface Config {

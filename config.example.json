@@ -24,6 +24,7 @@
     "retryBackoffMaxMs": 30000,
     "paymentMethod": "credit_card",
     "sessionFile": "session.json",
-    "logDir": "logs"
+    "logDir": "logs",
+    "approvalMethod": "stdin"
   }
 }

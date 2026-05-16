@@ -13,7 +13,7 @@
 import { chromium, BrowserContext } from "playwright";
 import * as path from "path";
 import * as fs from "fs";
-import { loadConfig, loadCredentials } from "./config";
+import { loadConfig, loadCredentials, loadTelegramCredentials } from "./config";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
 import { loadSession, login, saveSession, isLoggedIn, ChallengeDetectedError } from "./auth";
@@ -178,6 +178,10 @@ async function main(): Promise<void> {
 
   // Validate credentials exist before launching browser
   loadCredentials(); // throws if LAZADA_EMAIL or LAZADA_PASSWORD is absent
+  if (config.settings.approvalMethod === "telegram") {
+    loadTelegramCredentials(); // fail fast if TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing
+    logger.info("main", "telegram_approval_enabled");
+  }
 
   // ── Browser setup ────────────────────────────────────────────────────────
 
