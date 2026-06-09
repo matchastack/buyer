@@ -187,35 +187,41 @@ async function selectPaymentMethod(
   logger: Logger
 ): Promise<void> {
   const method = paymentMethod.toLowerCase();
-  const options = page.locator(
-    SELECTORS.checkout.paymentMethodOption.candidates.join(", ")
-  );
 
-  const count = await options.count().catch(() => 0);
-  if (count === 0) {
-    logger.warn(MODULE, "no_payment_options_found", { paymentMethod });
-    return;
-  }
+  // Try each candidate in order — use the first that yields any elements
+  let totalFound = 0;
+  for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
+    const options = page.locator(candidate);
+    const count = await options.count().catch(() => 0);
+    if (count === 0) continue;
 
-  for (let i = 0; i < count; i++) {
-    const option = options.nth(i);
-    const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
+    totalFound = count;
+    for (let i = 0; i < count; i++) {
+      const option = options.nth(i);
+      const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
 
-    const matches =
-      (method === "credit_card" && (text.includes("credit") || text.includes("debit") || text.includes("card"))) ||
-      (method === "cod" && (text.includes("cash on delivery") || text.includes("cod"))) ||
-      (method === "paynow" && text.includes("paynow")) ||
-      (method !== "credit_card" && method !== "cod" && method !== "paynow" && text.includes(method));
+      const matches =
+        (method === "credit_card" && (text.includes("credit") || text.includes("debit") || text.includes("card"))) ||
+        (method === "cod" && (text.includes("cash on delivery") || text.includes("cod"))) ||
+        (method === "paynow" && text.includes("paynow")) ||
+        (method !== "credit_card" && method !== "cod" && method !== "paynow" && text.includes(method));
 
-    if (matches) {
-      await option.click().catch(() => {});
-      logger.info(MODULE, "payment_method_selected", { paymentMethod, matchedText: text.trim() });
-      await page.waitForTimeout(1_000);
-      return;
+      if (matches) {
+        await option.click().catch(() => {});
+        logger.info(MODULE, "payment_method_selected", { paymentMethod, matchedText: text.trim() });
+        await page.waitForTimeout(1_000);
+        return;
+      }
     }
+    // Found elements with this candidate but none matched the desired method
+    break;
   }
 
-  logger.warn(MODULE, "payment_method_not_matched", { paymentMethod, optionsFound: count });
+  if (totalFound === 0) {
+    logger.warn(MODULE, "no_payment_options_found", { paymentMethod });
+  } else {
+    logger.warn(MODULE, "payment_method_not_matched", { paymentMethod, optionsFound: totalFound });
+  }
 }
 
 async function buildOrderSummary(
@@ -254,36 +260,35 @@ async function waitForConfirmation(
   itemName: string,
   logger: Logger
 ): Promise<CheckoutResult> {
-  try {
-    await page.waitForSelector(
-      SELECTORS.confirmation.successHeading.candidates.join(", "),
-      { timeout: 20_000 }
-    );
+  const resolved = await resolveSelector(page, SELECTORS.confirmation.successHeading, 20_000).catch(
+    () => null
+  );
 
+  if (resolved !== null) {
     const orderNumberText = await extractText(page, SELECTORS.confirmation.orderNumber, logger);
     const orderNumber = orderNumberText?.trim().replace(/[^A-Za-z0-9-]/g, "") ?? null;
 
     logger.info(MODULE, "order_confirmed", { item: itemName, orderNumber });
     return { success: true, orderNumber, error: null };
-  } catch {
-    // Check if we're still on checkout (may be 3DS or additional step)
-    if (page.url().includes("/checkout")) {
-      const bodyText = (await page.locator("body").textContent().catch(() => "")) ?? "";
-      if (
-        bodyText.toLowerCase().includes("failed") ||
-        bodyText.toLowerCase().includes("error") ||
-        bodyText.toLowerCase().includes("declined")
-      ) {
-        const error = "Payment failed or was declined — check your payment method.";
-        logger.error(MODULE, "payment_failed", { item: itemName });
-        return { success: false, orderNumber: null, error };
-      }
-    }
-
-    const error = "Order confirmation not detected — verify order status on Lazada manually.";
-    logger.error(MODULE, "confirmation_not_detected", { item: itemName, url: page.url() });
-    return { success: false, orderNumber: null, error };
   }
+
+  // Check if we're still on checkout (may be 3DS or additional step)
+  if (page.url().includes("/checkout")) {
+    const bodyText = (await page.locator("body").textContent().catch(() => "")) ?? "";
+    if (
+      bodyText.toLowerCase().includes("failed") ||
+      bodyText.toLowerCase().includes("error") ||
+      bodyText.toLowerCase().includes("declined")
+    ) {
+      const error = "Payment failed or was declined — check your payment method.";
+      logger.error(MODULE, "payment_failed", { item: itemName });
+      return { success: false, orderNumber: null, error };
+    }
+  }
+
+  const error = "Order confirmation not detected — verify order status on Lazada manually.";
+  logger.error(MODULE, "confirmation_not_detected", { item: itemName, url: page.url() });
+  return { success: false, orderNumber: null, error };
 }
 
 function sleep(ms: number): Promise<void> {
