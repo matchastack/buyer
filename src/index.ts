@@ -70,6 +70,11 @@ async function runItemWorker(
         logger.error("worker", "anti_bot_detected_worker_halt", { item: item.name });
         throw new Error(`Anti-bot challenge on "${item.name}" — halting worker`);
       }
+
+      if (result.status === "login_required") {
+        logger.error("worker", "worker_halted_login_expired", { item: item.name });
+        throw new Error(`Session expired for "${item.name}" — halting worker. Re-authenticate and restart.`);
+      }
       return;
     }
 

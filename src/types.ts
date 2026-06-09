@@ -75,9 +75,9 @@ export interface DecisionResult {
 export interface OrderSummary {
   itemName: string;
   itemUrl: string;
-  price: number;
+  price: number | null;
   quantity: number;
-  estimatedTotal: number;
+  estimatedTotal: number | null;
   deliveryAddress: string; // As scraped from checkout page
   paymentMethod: string;   // As detected on checkout page
 }
