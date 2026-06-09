@@ -82,7 +82,7 @@ export async function checkStock(
   }
 
   const price = await extractPrice(page, item.name, logger);
-  const status = await determineStatus(page, item.name, logger);
+  const status = await determineStatus(page, item.name, logger, price);
 
   logger.info(MODULE, "stock_check", {
     item: item.name,
@@ -191,9 +191,10 @@ async function extractPrice(
 async function determineStatus(
   page: Page,
   itemName: string,
-  logger: Logger
+  logger: Logger,
+  price: number | null
 ): Promise<StockCheckResult["status"]> {
-  // Out-of-stock markers take precedence
+  // Explicit OOS markers take highest precedence
   const oos = await resolveSelector(page, SELECTORS.product.outOfStockIndicator, 2_000).catch(
     () => null
   );
@@ -202,8 +203,7 @@ async function determineStatus(
     return "out_of_stock";
   }
 
-  // Buy Now is the strongest positive signal — only count it if it is enabled
-  // (on out-of-stock pages Lazada often keeps the button visible but disabled)
+  // Enabled buy button = in stock
   const buyNow = await resolveSelector(page, SELECTORS.product.buyNowButton, 2_000).catch(
     () => null
   );
@@ -212,13 +212,20 @@ async function determineStatus(
     if (enabled) return "in_stock";
   }
 
-  // Add to Cart is also a positive signal — same disabled guard
   const addToCart = await resolveSelector(page, SELECTORS.product.addToCartButton, 2_000).catch(
     () => null
   );
   if (addToCart) {
     const enabled = await page.locator(addToCart.selector).first().isEnabled().catch(() => false);
     if (enabled) return "in_stock";
+  }
+
+  // Price present means the product page loaded correctly — no buy path means out of stock.
+  // Return "unknown" only when the page state is genuinely indeterminate (navigation error,
+  // challenge page, or completely unexpected DOM where even the price is absent).
+  if (price !== null) {
+    logger.debug(MODULE, "oos_inferred_no_buy_button", { itemName });
+    return "out_of_stock";
   }
 
   return "unknown";
