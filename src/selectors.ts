@@ -138,6 +138,11 @@ export const SELECTORS = {
         'button:has-text("Sold Out")',
         '[class*="sold-out"]',
         '[class*="out-of-stock"]',
+        // Lazada often keeps standard buttons visible but disabled when out-of-stock
+        'button[disabled]:has-text("Add to Cart")',
+        'button[disabled]:has-text("Buy Now")',
+        'button[aria-disabled="true"]:has-text("Add to Cart")',
+        'button[aria-disabled="true"]:has-text("Buy Now")',
       ],
       required: false,
     } satisfies SelectorSet,

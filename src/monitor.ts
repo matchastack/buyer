@@ -186,17 +186,24 @@ async function determineStatus(
     return "out_of_stock";
   }
 
-  // Buy Now is the strongest positive signal
+  // Buy Now is the strongest positive signal — only count it if it is enabled
+  // (on out-of-stock pages Lazada often keeps the button visible but disabled)
   const buyNow = await resolveSelector(page, SELECTORS.product.buyNowButton, 2_000).catch(
     () => null
   );
-  if (buyNow) return "in_stock";
+  if (buyNow) {
+    const enabled = await page.locator(buyNow.selector).first().isEnabled().catch(() => false);
+    if (enabled) return "in_stock";
+  }
 
-  // Add to Cart is also a positive signal
+  // Add to Cart is also a positive signal — same disabled guard
   const addToCart = await resolveSelector(page, SELECTORS.product.addToCartButton, 2_000).catch(
     () => null
   );
-  if (addToCart) return "in_stock";
+  if (addToCart) {
+    const enabled = await page.locator(addToCart.selector).first().isEnabled().catch(() => false);
+    if (enabled) return "in_stock";
+  }
 
   return "unknown";
 }
