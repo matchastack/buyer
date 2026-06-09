@@ -1,28 +1,28 @@
 /**
  * Checkout orchestrator.
  *
- * Composes browser-actions, selectors, payment-approval, and decision
- * to execute a single checkout attempt.
+ * Flow per attempt:
+ *   1. Navigate to product page → click Buy Now (no Add to Cart fallback)
+ *   2. Wait for checkout page
+ *   3. Select PayNow
+ *   4. Click Place Order
+ *   5. Wait for confirmation (Lazada sends a PayNow QR — user scans to complete payment)
  *
- * Safety guarantees:
- *  - Dry-run guard is the FIRST check — aborts before any page navigation.
- *  - OrderSummary is built from live page data, not config values.
- *  - User must type "CONFIRM" before Place Order is clicked.
- *  - Anti-bot challenges halt checkout immediately.
+ * Anti-bot challenges halt checkout immediately.
+ * Dry-run guard is the FIRST check — aborts before any page navigation.
  */
 
 import { Page } from "playwright";
-import { Item, Config, OrderSummary, CheckoutResult } from "./types";
+import { Item, Config, CheckoutResult } from "./types";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
-import { SELECTORS } from "./selectors";
-import { resolveSelector } from "./selectors";
+import { SELECTORS, resolveSelector } from "./selectors";
 import { detectChallenge, ChallengeDetectedError } from "./auth";
 import { navigateTo, clickElement, isVisible, extractText, waitForUrl } from "./browser-actions";
-import { requestApproval, ApprovalRejectedError, ApprovalTimeoutError } from "./payment-approval";
 
 const MODULE = "checkout";
 const LAZADA_DOMAIN = "www.lazada.sg";
+const PAYMENT_METHOD = "paynow";
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -46,9 +46,7 @@ export async function checkout(
   for (let attempt = 1; attempt <= config.settings.maxRetries; attempt++) {
     const result = await attemptCheckout(page, item, config, rateLimiter, logger, attempt);
 
-    if (result.success || result.error === "approval_rejected" || result.error === "approval_timeout") {
-      return result; // Don't retry if user explicitly rejected or timed out
-    }
+    if (result.success) return result;
 
     if (attempt < config.settings.maxRetries) {
       const backoffMs = Math.min(
@@ -86,60 +84,37 @@ async function attemptCheckout(
     const challenge = await detectChallenge(page, logger);
     if (challenge) throw new ChallengeDetectedError(challenge);
 
-    // Set quantity if > 1
     if (item.quantity > 1) {
       await setQuantity(page, item.quantity, logger);
     }
 
-    // Prefer "Buy Now" (skips cart, faster checkout)
+    // Buy Now only — no Add to Cart fallback
     const buyNowVisible = await isVisible(page, SELECTORS.product.buyNowButton, logger, 3_000);
-
-    if (buyNowVisible) {
-      await clickElement(page, SELECTORS.product.buyNowButton, logger);
-      logger.info(MODULE, "clicked_buy_now", { item: item.name, attempt });
-    } else {
-      await clickElement(page, SELECTORS.product.addToCartButton, logger);
-      logger.info(MODULE, "clicked_add_to_cart", { item: item.name, attempt });
-      await navigateFromCartToCheckout(page, rateLimiter, logger);
+    if (!buyNowVisible) {
+      logger.warn(MODULE, "buy_now_unavailable", { item: item.name, attempt });
+      return { success: false, orderNumber: null, error: "Buy Now button not found" };
     }
 
-    // Wait for checkout page URL
+    await clickElement(page, SELECTORS.product.buyNowButton, logger);
+    logger.info(MODULE, "clicked_buy_now", { item: item.name, attempt });
+
     await waitForUrl(
       page,
-      (url) => url.pathname.includes("/checkout") || url.pathname.includes("/cart"),
+      (url) => url.pathname.includes("/checkout"),
       15_000,
       logger
     );
 
-    if (page.url().includes("/cart")) {
-      await navigateFromCartToCheckout(page, rateLimiter, logger);
-    }
-
     logger.info(MODULE, "on_checkout_page", { item: item.name });
 
-    // Select payment method
-    await selectPaymentMethod(page, config.settings.paymentMethod, logger);
+    await selectPaymentMethod(page, logger);
 
-    // Build OrderSummary from live page data
-    const summary = await buildOrderSummary(page, item, logger);
-
-    // ── User confirmation gate ─────────────────────────────────────────────
-    await requestApproval(summary, logger, config.settings);
-    // ── Only executes if user approves (CONFIRM via stdin, or Approve via Telegram) ─
-
+    // Place order — Lazada will display a PayNow QR for the user to scan
     await clickElement(page, SELECTORS.checkout.placeOrderButton, logger);
     logger.info(MODULE, "place_order_clicked", { item: item.name });
 
     return await waitForConfirmation(page, item.name, logger);
   } catch (err) {
-    if (err instanceof ApprovalRejectedError) {
-      logger.warn(MODULE, "purchase_rejected_by_user", { item: item.name });
-      return { success: false, orderNumber: null, error: "approval_rejected" };
-    }
-    if (err instanceof ApprovalTimeoutError) {
-      logger.warn(MODULE, "purchase_timed_out_awaiting_approval", { item: item.name });
-      return { success: false, orderNumber: null, error: "approval_timeout" };
-    }
     if (err instanceof ChallengeDetectedError) {
       logger.error(MODULE, "anti_bot_challenge_during_checkout", {
         item: item.name,
@@ -171,88 +146,27 @@ async function setQuantity(page: Page, quantity: number, logger: Logger): Promis
   logger.debug(MODULE, "quantity_set", { quantity });
 }
 
-async function navigateFromCartToCheckout(
-  page: Page,
-  rateLimiter: RateLimiter,
-  logger: Logger
-): Promise<void> {
-  await rateLimiter.acquire(LAZADA_DOMAIN);
-  await clickElement(page, SELECTORS.cart.proceedToCheckout, logger);
-  await page.waitForTimeout(2_000);
-}
-
-async function selectPaymentMethod(
-  page: Page,
-  paymentMethod: string,
-  logger: Logger
-): Promise<void> {
-  const method = paymentMethod.toLowerCase();
-
-  // Try each candidate in order — use the first that yields any elements
-  let totalFound = 0;
+async function selectPaymentMethod(page: Page, logger: Logger): Promise<void> {
   for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
     const options = page.locator(candidate);
     const count = await options.count().catch(() => 0);
     if (count === 0) continue;
 
-    totalFound = count;
     for (let i = 0; i < count; i++) {
       const option = options.nth(i);
       const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
 
-      const matches =
-        (method === "credit_card" && (text.includes("credit") || text.includes("debit") || text.includes("card"))) ||
-        (method === "cod" && (text.includes("cash on delivery") || text.includes("cod"))) ||
-        (method === "paynow" && text.includes("paynow")) ||
-        (method !== "credit_card" && method !== "cod" && method !== "paynow" && text.includes(method));
-
-      if (matches) {
+      if (text.includes("paynow")) {
         await option.click().catch(() => {});
-        logger.info(MODULE, "payment_method_selected", { paymentMethod, matchedText: text.trim() });
+        logger.info(MODULE, "payment_method_selected", { paymentMethod: PAYMENT_METHOD });
         await page.waitForTimeout(1_000);
         return;
       }
     }
-    // Found elements with this candidate but none matched the desired method
-    break;
+    break; // found elements with this candidate but no PayNow match
   }
 
-  if (totalFound === 0) {
-    logger.warn(MODULE, "no_payment_options_found", { paymentMethod });
-  } else {
-    logger.warn(MODULE, "payment_method_not_matched", { paymentMethod, optionsFound: totalFound });
-  }
-}
-
-async function buildOrderSummary(
-  page: Page,
-  item: Item,
-  logger: Logger
-): Promise<OrderSummary> {
-  const priceText = await extractText(page, SELECTORS.checkout.orderTotal, logger);
-  const addressText = await extractText(page, SELECTORS.checkout.deliveryAddress, logger);
-  const paymentLabel = await extractText(page, SELECTORS.checkout.selectedPaymentLabel, logger);
-
-  const priceMatch = priceText?.match(/[\d,]+\.?\d*/);
-  const price: number | null = priceMatch ? parseFloat(priceMatch[0].replace(",", "")) : null;
-
-  const summary: OrderSummary = {
-    itemName: item.name,
-    itemUrl: item.url,
-    price,
-    quantity: item.quantity,
-    estimatedTotal: price !== null ? parseFloat((price * item.quantity).toFixed(2)) : null,
-    deliveryAddress: addressText?.trim() ?? "(address not detected — verify in browser)",
-    paymentMethod: paymentLabel?.trim() ?? "(payment method not detected — verify in browser)",
-  };
-
-  logger.info(MODULE, "order_summary_built", {
-    item: item.name,
-    price: summary.price,
-    estimatedTotal: summary.estimatedTotal,
-  });
-
-  return summary;
+  logger.warn(MODULE, "paynow_option_not_found");
 }
 
 async function waitForConfirmation(
@@ -272,7 +186,6 @@ async function waitForConfirmation(
     return { success: true, orderNumber, error: null };
   }
 
-  // Check if we're still on checkout (may be 3DS or additional step)
   if (page.url().includes("/checkout")) {
     const bodyText = (await page.locator("body").textContent().catch(() => "")) ?? "";
     if (
@@ -280,7 +193,7 @@ async function waitForConfirmation(
       bodyText.toLowerCase().includes("error") ||
       bodyText.toLowerCase().includes("declined")
     ) {
-      const error = "Payment failed or was declined — check your payment method.";
+      const error = "Payment failed or was declined — check your PayNow setup.";
       logger.error(MODULE, "payment_failed", { item: itemName });
       return { success: false, orderNumber: null, error };
     }
