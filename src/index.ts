@@ -20,6 +20,7 @@ import { loadSession, login, saveSession, isLoggedIn, ChallengeDetectedError } f
 import { waitForStock } from "./monitor";
 import { shouldProceed, isAntiBot, computeBackoff, formatOrderSummary } from "./decision";
 import { checkout } from "./checkout";
+import { startHealthServer, RuntimeStatus, ItemStatus } from "./health";
 import { Item, Config, StockCheckResult } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -40,7 +41,9 @@ async function runItemWorker(
   context: BrowserContext,
   rateLimiter: RateLimiter,
   logger: Logger,
-  signal: AbortSignal
+  signal: AbortSignal,
+  itemStatus: ItemStatus,
+  runtimeStatus: RuntimeStatus
 ): Promise<void> {
   const page = await context.newPage();
 
@@ -54,6 +57,15 @@ async function runItemWorker(
       logger,
       signal
     );
+
+    // Update item health metrics after each stock check
+    itemStatus.lastChecked = result.timestamp;
+    itemStatus.lastStatus = result.status;
+    itemStatus.checkCount++;
+    if (result.status === "anti_bot") {
+      itemStatus.antiBotCount++;
+      runtimeStatus.totalChallengesDetected++;
+    }
 
     if (signal.aborted) {
       logger.info("worker", "aborted_before_decision", { item: item.name });
@@ -81,9 +93,11 @@ async function runItemWorker(
     // Checkout
     logger.info("worker", "starting_checkout", { item: item.name, price: result.price });
 
+    runtimeStatus.totalCheckoutAttempts++;
     const checkoutResult = await checkout(page, item, config, rateLimiter, logger);
 
     if (checkoutResult.success) {
+      runtimeStatus.totalPurchases++;
       logger.info("worker", "purchase_complete", {
         item: item.name,
         orderNumber: checkoutResult.orderNumber,
@@ -256,12 +270,45 @@ async function main(): Promise<void> {
     maxJitterMs: config.settings.maxPageLoadDelayMs - config.settings.minPageLoadDelayMs,
   });
 
+  // ── Runtime status (for health endpoint) ─────────────────────────────────
+
+  const itemStatuses: ItemStatus[] = config.items.map((item) => ({
+    name: item.name,
+    lastChecked: null,
+    lastStatus: null,
+    checkCount: 0,
+    antiBotCount: 0,
+  }));
+
+  const runtimeStatus: RuntimeStatus = {
+    startedAt: new Date().toISOString(),
+    dryRun: config.settings.dryRun,
+    items: itemStatuses,
+    totalChallengesDetected: 0,
+    totalCheckoutAttempts: 0,
+    totalPurchases: 0,
+  };
+
+  if (config.settings.healthPort > 0) {
+    startHealthServer(config.settings.healthPort, () => runtimeStatus);
+    logger.info("main", "health_server_started", { port: config.settings.healthPort });
+  }
+
   // ── Item workers ─────────────────────────────────────────────────────────
 
   logger.info("main", "workers_starting", { items: config.items.map((i) => i.name) });
 
-  const workers = config.items.map((item) =>
-    runItemWorker(item, config, context, rateLimiter, logger, controller.signal)
+  const workers = config.items.map((item, index) =>
+    runItemWorker(
+      item,
+      config,
+      context,
+      rateLimiter,
+      logger,
+      controller.signal,
+      itemStatuses[index]!,
+      runtimeStatus
+    )
   );
 
   const results = await Promise.allSettled(workers);

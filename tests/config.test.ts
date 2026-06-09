@@ -169,4 +169,42 @@ describe("loadConfig", () => {
   it("throws when config file does not exist", () => {
     expect(() => loadConfig("/nonexistent/path/config.json")).toThrow(/not found/i);
   });
+
+  it("defaults healthPort to 0 when not specified", () => {
+    const file = writeTmpConfig(VALID_CONFIG);
+    const config = loadConfig(file);
+    expect(config.settings.healthPort).toBe(0);
+  });
+
+  it("accepts healthPort = 0 (disabled)", () => {
+    const cfg = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, healthPort: 0 } };
+    const file = writeTmpConfig(cfg);
+    const config = loadConfig(file);
+    expect(config.settings.healthPort).toBe(0);
+  });
+
+  it("accepts a valid healthPort in the 1024–65535 range", () => {
+    const cfg = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, healthPort: 8080 } };
+    const file = writeTmpConfig(cfg);
+    const config = loadConfig(file);
+    expect(config.settings.healthPort).toBe(8080);
+  });
+
+  it("throws when healthPort is below 1024", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, healthPort: 80 } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/healthPort/i);
+  });
+
+  it("throws when healthPort exceeds 65535", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, healthPort: 70000 } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/healthPort/i);
+  });
+
+  it("throws when healthPort is a non-integer number", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, healthPort: 8080.5 } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/healthPort/i);
+  });
 });

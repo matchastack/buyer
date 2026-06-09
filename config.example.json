@@ -25,6 +25,7 @@
     "paymentMethod": "paynow",
     "sessionFile": "session.json",
     "logDir": "logs",
-    "approvalMethod": "stdin"
+    "approvalMethod": "stdin",
+    "healthPort": 0
   }
 }

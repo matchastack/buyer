@@ -77,6 +77,7 @@ const DEFAULTS: Settings = {
   dryRun: true,       // Safe default — must explicitly set false to enable purchases
   logDir: "logs",
   approvalMethod: "stdin", // Safe default — terminal-based approval
+  healthPort: 0,      // 0 = disabled; set to a port between 1024–65535 to enable
 };
 
 // ---------------------------------------------------------------------------
@@ -159,6 +160,14 @@ function validateSettings(raw: Record<string, unknown>): Settings {
   if (merged.approvalMethod !== "stdin" && merged.approvalMethod !== "telegram") {
     throw new ConfigValidationError(
       'settings.approvalMethod must be "stdin" or "telegram"'
+    );
+  }
+  if (
+    !Number.isInteger(merged.healthPort) ||
+    (merged.healthPort !== 0 && (merged.healthPort < 1024 || merged.healthPort > 65535))
+  ) {
+    throw new ConfigValidationError(
+      "settings.healthPort must be 0 (disabled) or an integer between 1024 and 65535"
     );
   }
 
