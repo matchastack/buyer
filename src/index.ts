@@ -11,14 +11,13 @@
  */
 
 import { chromium, BrowserContext } from "playwright";
-import * as path from "path";
-import * as fs from "fs";
+import * as dotenv from "dotenv";
 import { loadConfig, loadCredentials, loadTelegramCredentials } from "./config";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
 import { loadSession, login, saveSession, isLoggedIn, ChallengeDetectedError } from "./auth";
 import { waitForStock } from "./monitor";
-import { shouldProceed, isAntiBot, computeBackoff, formatOrderSummary } from "./decision";
+import { shouldProceed, isAntiBot } from "./decision";
 import { checkout } from "./checkout";
 import { startHealthServer, RuntimeStatus, ItemStatus } from "./health";
 import { Item, Config, StockCheckResult } from "./types";
@@ -154,24 +153,8 @@ async function verifySelectors(
 async function main(): Promise<void> {
   // ── Config & credentials ─────────────────────────────────────────────────
 
-  // Load .env if present (before config validation so env vars are available)
-  const envPath = path.join(process.cwd(), ".env");
-  if (fs.existsSync(envPath)) {
-    const envContent = fs.readFileSync(envPath, "utf-8");
-    for (const line of envContent.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith("#")) {
-        const eqIdx = trimmed.indexOf("=");
-        if (eqIdx > 0) {
-          const key = trimmed.slice(0, eqIdx).trim();
-          const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-          if (!process.env[key]) {
-            process.env[key] = val;
-          }
-        }
-      }
-    }
-  }
+  // Load .env if present (dotenv skips vars already set in environment)
+  dotenv.config();
 
   const config = loadConfig();
 

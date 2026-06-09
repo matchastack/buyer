@@ -64,6 +64,8 @@ export function loadTelegramCredentials(): TelegramCredentials {
 // Config defaults
 // ---------------------------------------------------------------------------
 
+const DEFAULT_DATA_DIR = "data";
+
 const DEFAULTS: Settings = {
   checkIntervalMs: 15_000,
   minPageLoadDelayMs: 3_000,
@@ -73,9 +75,10 @@ const DEFAULTS: Settings = {
   retryBackoffBaseMs: 2_000,
   retryBackoffMaxMs: 30_000,
   paymentMethod: "paynow",
-  sessionFile: "session.json",
+  dataDir: DEFAULT_DATA_DIR,
+  sessionFile: path.join(DEFAULT_DATA_DIR, "session.json"),
   dryRun: true,       // Safe default — must explicitly set false to enable purchases
-  logDir: "logs",
+  logDir: path.join(DEFAULT_DATA_DIR, "logs"),
   approvalMethod: "stdin", // Safe default — terminal-based approval
   healthPort: 0,      // 0 = disabled; set to a port between 1024–65535 to enable
 };
@@ -138,7 +141,14 @@ function validateSettings(raw: Record<string, unknown>): Settings {
     }
   }
 
-  const merged: Settings = { ...DEFAULTS, ...raw } as Settings;
+  // Derive sessionFile and logDir from dataDir unless explicitly overridden
+  const dataDir = typeof raw["dataDir"] === "string" ? raw["dataDir"] : DEFAULT_DATA_DIR;
+  const merged: Settings = {
+    ...DEFAULTS,
+    sessionFile: path.join(dataDir, "session.json"),
+    logDir: path.join(dataDir, "logs"),
+    ...raw,
+  } as Settings;
 
   if (merged.checkIntervalMs < 5_000) {
     throw new ConfigValidationError("settings.checkIntervalMs must be >= 5000ms to avoid rate-limiting");

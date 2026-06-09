@@ -47,13 +47,13 @@ cp config.example.json config.json
 #   → edit items[] with the product URLs you care about
 #   → keep "dryRun": true for first run
 
-# 3. First run in dry-run mode (also seeds session.json after login)
+# 3. First run in dry-run mode (also seeds the session file after login)
 npm run dev:dry-run
 ```
 
 The first run opens a visible browser so you can complete login (and solve a
-CAPTCHA if Lazada shows one). On success, `session.json` is saved and reused
-on subsequent runs.
+CAPTCHA if Lazada shows one). On success, `data/session.json` is saved and
+reused on subsequent runs.
 
 ---
 
@@ -81,8 +81,7 @@ Edit `config.json`:
     "retryBackoffBaseMs": 2000,
     "retryBackoffMaxMs": 30000,
     "paymentMethod": "paynow",
-    "sessionFile": "session.json",
-    "logDir": "logs"
+    "dataDir": "data"
   }
 }
 ```
@@ -139,7 +138,8 @@ risky logic is trivially testable.
 
 ## Logs
 
-Every run appends to `logs/audit-YYYY-MM-DD.log`, one JSON object per line.
+Every run appends to `data/logs/audit-YYYY-MM-DD.log`, one JSON object per line.
+The directory is set by `settings.dataDir` (default `"data"`) and can be overridden per-path via `settings.logDir`.
 Look for these `action` fields when reviewing a run:
 
 - `dry_run_skip` — purchase aborted because dry-run was on

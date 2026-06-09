@@ -12,13 +12,22 @@
     "verify-selectors": "ts-node src/index.ts --dry-run --verify-selectors",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src tests --ext .ts",
+    "lint:fix": "eslint src tests --ext .ts --fix",
+    "format": "prettier --write src tests"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
     "playwright": "^1.56.1"
   },
   "devDependencies": {
     "@types/node": "^22.19.18",
+    "@typescript-eslint/eslint-plugin": "^8.61.0",
+    "@typescript-eslint/parser": "^8.61.0",
+    "eslint": "^10.4.1",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.3",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"

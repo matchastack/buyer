@@ -54,7 +54,10 @@ export async function detectChallenge(
     url.includes("/baxia/") ||
     url.includes("/block") ||
     url.includes("/robot") ||
-    url.includes("captcha")
+    url.includes("captcha") ||
+    url.includes("/cdn-cgi/challenge-platform/") ||
+    url.includes("/awswaf/") ||
+    url.includes("/sec/")
   ) {
     const challenge: Challenge = { type: "captcha", url, detectedAt: new Date().toISOString() };
     logger.warn(MODULE, "challenge_detected_url", { url, type: challenge.type });
