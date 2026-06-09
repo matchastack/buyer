@@ -72,7 +72,7 @@ const DEFAULTS: Settings = {
   maxRetries: 3,
   retryBackoffBaseMs: 2_000,
   retryBackoffMaxMs: 30_000,
-  paymentMethod: "credit_card",
+  paymentMethod: "paynow",
   sessionFile: "session.json",
   dryRun: true,       // Safe default — must explicitly set false to enable purchases
   logDir: "logs",
