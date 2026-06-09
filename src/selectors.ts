@@ -114,7 +114,7 @@ export const SELECTORS = {
       description: "Add to Cart button (enabled = in stock)",
       candidates: [
         'button[data-spm-click*="cart"]',
-        'button[class*="add-to-cart"]',
+        // class*="add-to-cart" removed: Lazada's wishlist button shares this class substring
         'button:has-text("Add to Cart")',
       ],
       required: false,
@@ -124,7 +124,7 @@ export const SELECTORS = {
       description: "Buy Now button — takes directly to checkout",
       candidates: [
         'button[data-spm-click*="buynow"]',
-        'button[class*="buy-now"]',
+        // class*="buy-now" removed: Lazada's wishlist button shares this class substring
         'button:has-text("Buy Now")',
       ],
       required: false,
