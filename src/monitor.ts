@@ -8,6 +8,7 @@
  * Halts (returns "anti_bot") if a bot challenge is detected.
  */
 
+import * as path from "path";
 import { Page } from "playwright";
 import { Item, StockCheckResult } from "./types";
 import { Logger } from "./logger";
@@ -16,6 +17,7 @@ import { SELECTORS } from "./selectors";
 import { resolveSelector } from "./selectors";
 import { detectChallenge } from "./auth";
 import { navigateTo } from "./browser-actions";
+import { captureDomSnapshot, describeProductSelectors } from "./diagnostics";
 
 const MODULE = "monitor";
 const LAZADA_DOMAIN = "www.lazada.sg";
@@ -28,7 +30,8 @@ export async function checkStock(
   page: Page,
   item: Item,
   rateLimiter: RateLimiter,
-  logger: Logger
+  logger: Logger,
+  debugDir?: string
 ): Promise<StockCheckResult> {
   const timestamp = new Date().toISOString();
   const base: Omit<StockCheckResult, "status" | "price" | "pageTitle"> = {
@@ -72,8 +75,14 @@ export async function checkStock(
     return { ...base, status: "login_required", price: null, pageTitle };
   }
 
+  // Diagnostics — only when debug mode is active
+  if (debugDir) {
+    await captureDomSnapshot(page, item, debugDir, logger);
+    await describeProductSelectors(page, logger);
+  }
+
   const price = await extractPrice(page, item.name, logger);
-  const status = await determineStatus(page, item.name, logger);
+  const status = await determineStatus(page, item.name, logger, price);
 
   logger.info(MODULE, "stock_check", {
     item: item.name,
@@ -94,7 +103,9 @@ export async function waitForStock(
   intervalMs: number,
   rateLimiter: RateLimiter,
   logger: Logger,
-  signal: AbortSignal
+  signal: AbortSignal,
+  debugSnapshots = false,
+  debugDir?: string
 ): Promise<StockCheckResult> {
   logger.info(MODULE, "monitoring_started", {
     item: item.name,
@@ -102,8 +113,13 @@ export async function waitForStock(
     maxPrice: item.maxPrice,
   });
 
+  // Resolve debug dir once — derived from the caller-supplied path or cwd
+  const resolvedDebugDir = debugSnapshots
+    ? (debugDir ?? path.join(process.cwd(), "data", "debug"))
+    : undefined;
+
   while (!signal.aborted) {
-    const result = await checkStock(page, item, rateLimiter, logger);
+    const result = await checkStock(page, item, rateLimiter, logger, resolvedDebugDir);
 
     if (result.status === "anti_bot") {
       logger.error(MODULE, "monitoring_halted_anti_bot", { item: item.name });
@@ -175,9 +191,10 @@ async function extractPrice(
 async function determineStatus(
   page: Page,
   itemName: string,
-  logger: Logger
+  logger: Logger,
+  price: number | null
 ): Promise<StockCheckResult["status"]> {
-  // Out-of-stock markers take precedence
+  // Explicit OOS markers take highest precedence
   const oos = await resolveSelector(page, SELECTORS.product.outOfStockIndicator, 2_000).catch(
     () => null
   );
@@ -186,17 +203,30 @@ async function determineStatus(
     return "out_of_stock";
   }
 
-  // Buy Now is the strongest positive signal
+  // Enabled buy button = in stock
   const buyNow = await resolveSelector(page, SELECTORS.product.buyNowButton, 2_000).catch(
     () => null
   );
-  if (buyNow) return "in_stock";
+  if (buyNow) {
+    const enabled = await page.locator(buyNow.selector).first().isEnabled().catch(() => false);
+    if (enabled) return "in_stock";
+  }
 
-  // Add to Cart is also a positive signal
   const addToCart = await resolveSelector(page, SELECTORS.product.addToCartButton, 2_000).catch(
     () => null
   );
-  if (addToCart) return "in_stock";
+  if (addToCart) {
+    const enabled = await page.locator(addToCart.selector).first().isEnabled().catch(() => false);
+    if (enabled) return "in_stock";
+  }
+
+  // Price present means the product page loaded correctly — no buy path means out of stock.
+  // Return "unknown" only when the page state is genuinely indeterminate (navigation error,
+  // challenge page, or completely unexpected DOM where even the price is absent).
+  if (price !== null) {
+    logger.debug(MODULE, "oos_inferred_no_buy_button", { itemName });
+    return "out_of_stock";
+  }
 
   return "unknown";
 }

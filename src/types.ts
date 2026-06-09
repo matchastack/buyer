@@ -49,6 +49,7 @@ export interface Settings {
   logDir: string;                // Directory for audit log files (default: <dataDir>/logs)
   approvalMethod: ApprovalMethod; // How to gate purchases: terminal stdin or Telegram bot
   healthPort: number;             // 0 = disabled; 1024–65535 = bind health HTTP server on 127.0.0.1
+  debugSnapshots: boolean;        // true = write DOM snapshots + selector report to <dataDir>/debug on each check
 }
 
 export interface Config {

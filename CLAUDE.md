@@ -16,6 +16,9 @@ npm run start               # Run the built dist/index.js
 npm run start:dry-run       # Built version, forced dry-run
 npm run verify-selectors    # Headed dry-run that opens login + first product page
                             #   and reports which selector candidates resolve
+npm run dev:dry-run -- --debug-dom   # Same as dev:dry-run but also writes a full-page
+                            #   screenshot + HTML + per-selector match report to data/debug/
+                            #   on every stock check. Use when investigating selector bugs.
 npm test                    # vitest run (one-shot)
 npm run test:watch          # vitest watch mode
 npm run test:coverage       # vitest with coverage
@@ -51,6 +54,7 @@ config + env  ──►  auth (load/restore session, login if needed)
 - **`payment-approval.ts`** — Human approval gate (stdin readline or Telegram inline keyboard). **Not currently called from `checkout.ts`** — the PayNow QR serves as the payment confirmation step. The module is retained for reference if the gate is needed again.
 - **`browser-actions.ts`** — Thin Playwright wrappers (`navigateTo`, `clickElement`, `fillInput`, `extractText`, `isVisible`, `waitForUrl`). They **only accept `SelectorSet` objects, never raw CSS strings** — this is enforced by type. `navigateTo` retries 3× with backoff.
 - **`selectors.ts`** — The single source of truth for every DOM selector in the app. `SELECTORS` is structured by page (`login`, `antiBot`, `product`, `cart`, `checkout`, `confirmation`). Each `SelectorSet` has `candidates` (tried in order, first visible wins), `description`, and `required` (true ⇒ throw `SelectorNotFoundError`; false ⇒ return null). Text-based `:has-text()` candidates are listed last as resilient fallbacks. **All selectors are unverified against live Lazada pages — run `npm run verify-selectors` after any Lazada UI change.**
+- **`diagnostics.ts`** — DOM-capture helpers for debugging selector issues. `captureDomSnapshot` saves a full-page screenshot + HTML to `<dataDir>/debug/`. `describeProductSelectors` logs each `SELECTORS.product` set with `{ winner, matchCount, firstText, firstVisible, firstEnabled }` — the `matchCount` shows whether a selector resolves once (real buy-box) or many times (carousels). Activated by `--debug-dom` or `"debugSnapshots": true` in config; no-ops otherwise.
 - **`health.ts`** — Optional local HTTP metrics server. `startHealthServer(port, getStatus)` binds to `127.0.0.1` only (never `0.0.0.0`) using Node's built-in `http` module. Responds to any request with a JSON `RuntimeStatus` snapshot (per-item check counts, last stock status, checkout/purchase tallies). Enabled only when `settings.healthPort > 0`; disabled by default (`healthPort: 0`).
 - **`rate-limiter.ts`** — Per-domain `acquire(domain)` enforces `minIntervalMs` since last request plus random jitter up to `maxJitterMs`. Called before every page navigation in `monitor` and `checkout`.
 - **`logger.ts`** — Append-only JSONL audit log at `logs/audit-YYYY-MM-DD.log` plus colored stdout/stderr. Never truncates. Logging errors are swallowed so the main process can never crash from log I/O.
@@ -71,4 +75,5 @@ config + env  ──►  auth (load/restore session, login if needed)
 - `data/` — runtime artifacts root (configurable via `settings.dataDir`, default `"data"`)
   - `data/session.json` — persisted cookies (mode 0600)
   - `data/logs/audit-YYYY-MM-DD.log` — JSONL audit trail
+  - `data/debug/<item>-<timestamp>.png` / `.html` — DOM snapshots (only when `--debug-dom` is active)
 - `dist/` — tsc output
