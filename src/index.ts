@@ -17,7 +17,7 @@ import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
 import { loadSession, login, saveSession, isLoggedIn, ChallengeDetectedError } from "./auth";
 import { waitForStock } from "./monitor";
-import { shouldProceed, isAntiBot, computeBackoff, formatOrderSummary } from "./decision";
+import { shouldProceed, isAntiBot } from "./decision";
 import { checkout } from "./checkout";
 import { Item, Config, StockCheckResult } from "./types";
 

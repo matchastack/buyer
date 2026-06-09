@@ -12,7 +12,10 @@
     "verify-selectors": "ts-node src/index.ts --dry-run --verify-selectors",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src tests --ext .ts",
+    "lint:fix": "eslint src tests --ext .ts --fix",
+    "format": "prettier --write src tests"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
