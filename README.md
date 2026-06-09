@@ -3,12 +3,12 @@
 Automated monitor and checkout assistant for Pokemon Center SG drops on
 Lazada. It polls product pages on a jittered schedule, decides whether to
 proceed based on stock and price rules, drives a real Chromium browser through
-Lazada's checkout via Playwright, and **stops at a human-approval gate before
-ever clicking "Place Order"**.
+Lazada's checkout via Playwright, and places the order via **PayNow** — Lazada
+displays a QR code which you scan to complete the transfer.
 
 > This tool is intended for **personal use** to help you compete with bots on
 > limited drops. It does not bypass payment, does not store credentials in
-> the repo, and never auto-submits an order without you saying yes.
+> the repo. PayNow QR scanning is the final human confirmation step.
 
 ---
 
@@ -24,10 +24,10 @@ The whole design is shaped by four invariants. None of them are optional:
    variables (`LAZADA_EMAIL`, `LAZADA_PASSWORD`), loaded from a `.env` file
    that is `.gitignore`d. The config loader rejects any config with a
    `credentials`, `email`, or `password` key.
-3. **No purchase without explicit human approval.** Every checkout pauses at
-   `requestApproval()` — either type `CONFIRM` in the terminal, or tap
-   **Approve** on a Telegram message. Two minutes without a response =
-   timeout = no purchase.
+3. **Payment requires a human action.** The checkout uses PayNow exclusively.
+   After Place Order is clicked, Lazada displays a PayNow QR code that you
+   must scan and approve in your banking app — money never moves without you
+   physically completing that step.
 4. **Anti-bot challenges halt immediately.** CAPTCHA / slider / rate-limit
    pages are detected, logged, and the run aborts. The code does not attempt
    to solve them.
@@ -57,22 +57,6 @@ on subsequent runs.
 
 ---
 
-## Approval methods
-
-`settings.approvalMethod` selects how purchases are gated:
-
-| Value | How it works | Use when |
-| --- | --- | --- |
-| `"stdin"` *(default)* | Prompts in the terminal — type `CONFIRM` | Running locally with the terminal visible |
-| `"telegram"` | Sends a message with **Approve** / **Reject** buttons to a Telegram bot | Running on a server / you want phone approval |
-
-For Telegram: create a bot via **@BotFather**, send it a message, find your
-chat id via `https://api.telegram.org/bot<TOKEN>/getUpdates`, and set
-`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` in `.env`. The bot uses HTTP long
-polling, so the host needs only outbound internet — no inbound ports.
-
----
-
 ## Configuration
 
 Edit `config.json`:
@@ -96,10 +80,9 @@ Edit `config.json`:
     "maxRetries": 3,
     "retryBackoffBaseMs": 2000,
     "retryBackoffMaxMs": 30000,
-    "paymentMethod": "credit_card",
+    "paymentMethod": "paynow",
     "sessionFile": "session.json",
-    "logDir": "logs",
-    "approvalMethod": "stdin"
+    "logDir": "logs"
   }
 }
 ```
@@ -112,8 +95,7 @@ Settings of note:
   conservative.
 - `headless` — set `false` for first login or selector debugging; `true`
   once the session is seeded and you're running on a server.
-- `paymentMethod` — `"credit_card"`, `"cod"`, `"paynow"`, or a custom
-  string matched against the on-page payment label.
+- `paymentMethod` — hardcoded to `"paynow"` in `checkout.ts`; this config key is kept for reference but has no effect on the current flow.
 
 ---
 
@@ -139,8 +121,8 @@ src/
   config.ts           Config loader/validator, env-var credentials
   monitor.ts          Stock polling loop with rate limiting
   decision.ts         Pure decision functions (proceed/skip, backoff, formatters)
-  checkout.ts         Single-attempt + retry orchestration
-  payment-approval.ts Human approval gate (stdin or Telegram)
+  checkout.ts         Buy Now → PayNow → Place Order orchestration + retry
+  payment-approval.ts Human approval gate (stdin or Telegram) — retained, not active
   auth.ts             Login flow, session save/load, anti-bot detection
   browser-actions.ts  Thin Playwright wrappers
   selectors.ts        Centralised CSS selector candidates
@@ -161,8 +143,11 @@ Every run appends to `logs/audit-YYYY-MM-DD.log`, one JSON object per line.
 Look for these `action` fields when reviewing a run:
 
 - `dry_run_skip` — purchase aborted because dry-run was on
-- `approval_requested` / `approval_granted` / `approval_rejected` / `approval_timeout`
-- `order_summary_built` — what the gate showed you
+- `buy_now_unavailable` — Buy Now button not found; attempt failed
+- `clicked_buy_now` — navigating to checkout
+- `payment_method_selected` — PayNow was selected on the checkout page
+- `place_order_clicked` — order submitted; Lazada now shows PayNow QR
+- `order_confirmed` — confirmation page detected
 - `purchase_complete` — only emitted on a confirmed order
 
 ---
