@@ -234,14 +234,14 @@ async function buildOrderSummary(
   const paymentLabel = await extractText(page, SELECTORS.checkout.selectedPaymentLabel, logger);
 
   const priceMatch = priceText?.match(/[\d,]+\.?\d*/);
-  const price = priceMatch ? parseFloat(priceMatch[0].replace(",", "")) : item.maxPrice;
+  const price: number | null = priceMatch ? parseFloat(priceMatch[0].replace(",", "")) : null;
 
   const summary: OrderSummary = {
     itemName: item.name,
     itemUrl: item.url,
     price,
     quantity: item.quantity,
-    estimatedTotal: parseFloat((price * item.quantity).toFixed(2)),
+    estimatedTotal: price !== null ? parseFloat((price * item.quantity).toFixed(2)) : null,
     deliveryAddress: addressText?.trim() ?? "(address not detected — verify in browser)",
     paymentMethod: paymentLabel?.trim() ?? "(payment method not detected — verify in browser)",
   };
