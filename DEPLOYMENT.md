@@ -62,7 +62,7 @@ sudo adduser --disabled-password --gecos "" buyer
 sudo -iu buyer
 git clone <repo-url> ~/buyer && cd ~/buyer
 npm ci
-npx playwright install --with-deps chromium   # installs Chromium + system libs
+npx playwright install --with-deps chromium   # version tied to playwright 1.56.1 in package.json
 
 # 4. Configure
 cp .env.example .env && nano .env             # Lazada creds + Telegram bot/chat id
