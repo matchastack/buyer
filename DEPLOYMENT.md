@@ -1,9 +1,10 @@
 # Deployment
 
 This app is a long-running, single-instance Node.js daemon that drives a Chromium
-browser (Playwright) and waits for a human to approve each purchase. Approval
-can happen on your phone via a Telegram bot, so the deployment does **not** need
-any inbound ports — outbound HTTPS is sufficient.
+browser (Playwright). When stock is detected it clicks Buy Now, selects PayNow,
+and places the order. Lazada then shows a PayNow QR that you scan in your
+banking app to complete the transfer. No inbound ports are needed — outbound
+HTTPS is sufficient.
 
 ## TL;DR
 
@@ -13,27 +14,20 @@ any inbound ports — outbound HTTPS is sufficient.
 | Size | 2 vCPU shared, 2 GB RAM, 50 GB SSD |
 | Cost | **~$12–14 / month** all-in |
 | Process supervisor | systemd |
-| Approval gate | Telegram bot (`settings.approvalMethod = "telegram"`) |
+| Payment confirmation | PayNow QR (scan in banking app after Place Order) |
 
-Two reasons for SGP1: (1) Lazada SG profiles non-SG IPs as suspicious, so a
-Singapore-region host minimises anti-bot friction and latency; (2) Telegram long
-polling keeps the app outbound-only — no reverse proxy, no TLS cert, no
-firewall holes.
+SGP1 is preferred because Lazada SG profiles non-SG IPs as suspicious — a
+Singapore-region host minimises anti-bot friction and latency. The app needs
+only outbound HTTPS — no reverse proxy, no TLS cert, no firewall holes.
 
 ---
 
 ## Prerequisites
 
 1. **Node.js 18+** on the target host.
-2. **A Lazada SG account** with payment method already set up in-app.
-3. **A Telegram bot** for mobile approvals:
-   - In Telegram, message **@BotFather** → `/newbot` → follow prompts → copy the
-     bot token.
-   - Send any message to your new bot (this creates a chat).
-   - Open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and
-     copy the numeric `chat.id` from the JSON.
-   - These two values become `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in
-     `.env`.
+2. **A Lazada SG account** with PayNow linked as a payment method in-app.
+3. **Your phone** nearby when the bot is live — you will need to scan the
+   PayNow QR that Lazada presents after Place Order is clicked.
 
 ---
 
@@ -73,7 +67,6 @@ npx playwright install --with-deps chromium   # installs Chromium + system libs
 # 4. Configure
 cp .env.example .env && nano .env             # Lazada creds + Telegram bot/chat id
 cp config.example.json config.json && nano config.json
-#   → set "approvalMethod": "telegram"
 #   → set "headless": true
 #   → keep "dryRun": true for first run
 chmod 600 .env
@@ -213,10 +206,10 @@ deploy:
 - `chmod 600 .env` on the host; never commit it.
 - `session.json` is written with mode `0600` by `src/auth.ts` — keep it that
   way; treat it like a password.
-- Treat the Telegram bot token like a password. Anyone with the token *and*
-  knowledge of the chat id can approve purchases. Rotate via @BotFather if
-  it leaks.
+- Have PayNow linked to your Lazada account before going live — the bot
+  selects it automatically and the QR will only appear if the payment method
+  is correctly configured on the Lazada side.
 - Keep `"dryRun": true` in `config.json` until you've verified an end-to-end
-  cycle on the host (item is detected → Telegram prompt arrives → tapping
-  **Reject** is honoured). Then flip to `false`.
+  cycle on the host (item is detected → checkout page is reached → PayNow QR
+  appears). Then flip to `false`.
 - Confirm the firewall only allows outbound; no inbound rules are needed.
