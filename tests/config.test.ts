@@ -112,6 +112,12 @@ describe("loadConfig", () => {
     expect(config.settings.dryRun).toBe(true);
   });
 
+  it("defaults paymentMethod to paynow when not specified", () => {
+    const file = writeTmpConfig({ ...VALID_CONFIG, settings: {} });
+    const config = loadConfig(file);
+    expect(config.settings.paymentMethod).toBe("paynow");
+  });
+
   it("throws when items array is empty", () => {
     const file = writeTmpConfig({ ...VALID_CONFIG, items: [] });
     expect(() => loadConfig(file)).toThrow(/items/i);
