@@ -81,7 +81,8 @@ Edit `config.json`:
     "retryBackoffBaseMs": 2000,
     "retryBackoffMaxMs": 30000,
     "paymentMethod": "paynow",
-    "dataDir": "data"
+    "dataDir": "data",
+    "healthPort": 0
   }
 }
 ```
@@ -95,6 +96,8 @@ Settings of note:
 - `headless` — set `false` for first login or selector debugging; `true`
   once the session is seeded and you're running on a server.
 - `paymentMethod` — hardcoded to `"paynow"` in `checkout.ts`; this config key is kept for reference but has no effect on the current flow.
+- `dataDir` — root directory for all runtime files (default `"data"`). Session is written to `<dataDir>/session.json` and logs to `<dataDir>/logs/` unless overridden by `sessionFile`/`logDir`.
+- `healthPort` — set to a port between 1024–65535 to start a local health HTTP server on `127.0.0.1:<port>` that returns a JSON status snapshot. `0` (default) disables it. See [DEPLOYMENT.md](./DEPLOYMENT.md) for example output.
 
 ---
 

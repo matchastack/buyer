@@ -31,6 +31,104 @@ only outbound HTTPS — no reverse proxy, no TLS cert, no firewall holes.
 
 ---
 
+## Running locally (your laptop / desktop)
+
+Use this when you want to run real purchases from your own machine. No server
+needed — the app runs as a foreground process you can watch.
+
+### Setup
+
+```bash
+# 1. Install deps and Chromium
+npm ci
+npx playwright install --with-deps chromium
+
+# 2. Configure credentials
+cp .env.example .env
+# Edit .env — fill in LAZADA_EMAIL and LAZADA_PASSWORD
+chmod 600 .env
+
+# 3. Configure items
+cp config.example.json config.json
+# Edit config.json — add your target item URLs, set maxPrice per item
+```
+
+Set these in `config.json` for local use:
+
+```json
+{
+  "settings": {
+    "headless": false,
+    "dryRun": true
+  }
+}
+```
+
+`headless: false` keeps the browser visible so you can see the PayNow QR when
+it appears. `dryRun: true` stays on until you've verified the full flow.
+
+### Seed the session (first run)
+
+```bash
+npm run dev:dry-run
+```
+
+This opens a browser, logs you into Lazada (solve any CAPTCHA manually), and
+saves `data/session.json`. Subsequent runs reuse the session silently.
+
+### Verify end-to-end in dry-run
+
+With `dryRun: true` still set, watch the logs confirm stock detection, price
+evaluation, and that checkout is reached but skipped:
+
+```
+[info] checkout     dry_run_skip   { item: "Pikachu Plush" }
+```
+
+### Go live
+
+Once you're confident the flow works, flip `dryRun` to `false`:
+
+```json
+"dryRun": false
+```
+
+Then run:
+
+```bash
+npm run dev
+```
+
+When an item comes into stock and the price is within `maxPrice`:
+
+1. The bot clicks **Buy Now** → navigates to checkout → selects PayNow.
+2. It clicks **Place Order** — Lazada displays a **PayNow QR**.
+3. **Open your banking app, scan the QR, and approve the payment.**
+   The order is only confirmed once you complete this step.
+4. The bot waits for the confirmation page and logs `order_confirmed`.
+
+> Keep your phone within reach. The PayNow QR has a short expiry (~5 min).
+> If you don't scan in time, the order fails and the bot retries up to
+> `maxRetries` times.
+
+### Optional: health endpoint
+
+Set `healthPort` to a free port to get a local status page at
+`http://127.0.0.1:<port>/`:
+
+```json
+"healthPort": 3456
+```
+
+```bash
+curl http://127.0.0.1:3456/ | jq .
+```
+
+Returns a JSON snapshot of item check counts, last stock status, and purchase
+totals. Useful for confirming the bot is running and polling correctly.
+
+---
+
 ## Recommended: DigitalOcean droplet in Singapore
 
 ### Sizing
@@ -65,10 +163,10 @@ npm ci
 npx playwright install --with-deps chromium   # version tied to playwright 1.56.1 in package.json
 
 # 4. Configure
-cp .env.example .env && nano .env             # Lazada creds + Telegram bot/chat id
+cp .env.example .env && nano .env             # fill in LAZADA_EMAIL, LAZADA_PASSWORD
 cp config.example.json config.json && nano config.json
-#   → set "headless": true
-#   → keep "dryRun": true for first run
+#   → set "headless": true   (no display on a headless server)
+#   → keep "dryRun": true    (flip to false only after verifying the flow)
 chmod 600 .env
 
 # 5. Build
@@ -129,6 +227,66 @@ journalctl -u buyer -f       # tail live logs
 The app already rotates its own audit log daily (`data/logs/audit-YYYY-MM-DD.log`),
 so no extra logrotate config is required.
 
+### Going live on the droplet
+
+Once dry-run is confirmed working, enable purchases:
+
+```bash
+# Edit config.json on the droplet
+nano ~/buyer/config.json
+# set "dryRun": false
+# set "headless": true   (already set)
+
+# Rebuild and restart
+npm run build
+sudo systemctl restart buyer
+sudo systemctl status buyer
+```
+
+When a purchase fires, Lazada shows a PayNow QR **in the headless browser** —
+since there is no screen, you need to intercept it from logs. The checkout logs
+`place_order_clicked` and then either `order_confirmed` (success) or
+`confirmation_not_detected` (failure). Check Lazada's app / website for the
+pending payment QR under **My Orders** if the log shows a failure.
+
+> For a better experience on a remote server consider running with
+> `headless: false` and a VNC session during the transition to live, so you
+> can see and scan the PayNow QR directly.
+
+### Optional: health endpoint on the droplet
+
+Add `"healthPort": 3456` (or any port 1024–65535) to `config.json` to expose
+a JSON status page on `127.0.0.1` only:
+
+```bash
+curl http://127.0.0.1:3456/ | jq .
+```
+
+```json
+{
+  "startedAt": "2026-06-09T08:00:00.000Z",
+  "dryRun": false,
+  "items": [
+    {
+      "name": "Pikachu Plush",
+      "lastChecked": "2026-06-09T08:05:12.000Z",
+      "lastStatus": "out_of_stock",
+      "checkCount": 20,
+      "antiBotCount": 0
+    }
+  ],
+  "totalCheckoutAttempts": 0,
+  "totalPurchases": 0
+}
+```
+
+To expose it over SSH from your laptop without opening a firewall port:
+
+```bash
+ssh -L 3456:127.0.0.1:3456 buyer@<droplet>
+# then open http://127.0.0.1:3456/ in your browser
+```
+
 ### Monthly cost
 
 | Item | Cost |
@@ -164,9 +322,11 @@ docker run -d --name buyer --restart unless-stopped \
   -v $PWD/config.json:/app/config.json:ro \
   -v $PWD/.env:/app/.env:ro \
   -v $PWD/data:/app/data \
-  -v $PWD/logs:/app/logs \
   buyer:latest
 ```
+
+The `data/` volume covers both the session file (`data/session.json`) and audit
+logs (`data/logs/`). No separate `logs` mount is needed.
 
 ---
 
@@ -191,8 +351,7 @@ Lambda / Cloud Run / Fly Machines on-demand are wrong fits for this app:
 - It's a stateful daemon with a persistent browser session and a per-item
   polling loop, not a request/response handler.
 - Lambda has a 15-minute execution ceiling.
-- Cloud Run scales to zero and would lose the browser session and the Telegram
-  long poller.
+- Cloud Run scales to zero and would lose the browser session.
 - Per-second pricing for a process that runs 24/7 ends up costing more than a
   $6 droplet.
 
