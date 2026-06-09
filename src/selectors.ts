@@ -274,7 +274,7 @@ export async function resolveSelector(
   timeoutMs = 3000
 ): Promise<ResolvedSelector | null> {
   for (let i = 0; i < selectorSet.candidates.length; i++) {
-    const candidate = selectorSet.candidates[i];
+    const candidate = selectorSet.candidates[i]!; // safe: i is within bounds (loop invariant)
     try {
       const visible = await page
         .locator(candidate)
