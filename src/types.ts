@@ -48,6 +48,7 @@ export interface Settings {
   dryRun: boolean;               // true = monitor only, NEVER purchase
   logDir: string;                // Directory for audit log files (default: <dataDir>/logs)
   approvalMethod: ApprovalMethod; // How to gate purchases: terminal stdin or Telegram bot
+  healthPort: number;             // 0 = disabled; 1024–65535 = bind health HTTP server on 127.0.0.1
 }
 
 export interface Config {

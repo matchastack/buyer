@@ -23,6 +23,8 @@
     "retryBackoffBaseMs": 2000,
     "retryBackoffMaxMs": 30000,
     "paymentMethod": "paynow",
+    "logDir": "logs",
+    "healthPort": 0
     "dataDir": "data",
     "approvalMethod": "stdin"
   }
