@@ -67,6 +67,7 @@ config + env  ──►  auth (load/restore session, login if needed)
 
 - `config.json` — your real config
 - `.env` — your credentials
-- `session.json` — persisted cookies (mode 0600)
-- `logs/audit-YYYY-MM-DD.log` — JSONL audit trail
+- `data/` — runtime artifacts root (configurable via `settings.dataDir`, default `"data"`)
+  - `data/session.json` — persisted cookies (mode 0600)
+  - `data/logs/audit-YYYY-MM-DD.log` — JSONL audit trail
 - `dist/` — tsc output

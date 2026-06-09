@@ -23,8 +23,7 @@
     "retryBackoffBaseMs": 2000,
     "retryBackoffMaxMs": 30000,
     "paymentMethod": "paynow",
-    "sessionFile": "session.json",
-    "logDir": "logs",
+    "dataDir": "data",
     "approvalMethod": "stdin"
   }
 }

@@ -43,9 +43,10 @@ export interface Settings {
   retryBackoffBaseMs: number;    // Exponential backoff base (ms)
   retryBackoffMaxMs: number;     // Cap for backoff delay (ms)
   paymentMethod: PaymentMethodKey; // Payment method to select at checkout
-  sessionFile: string;           // Path for persisted browser cookies
+  dataDir: string;               // Root directory for all runtime artifacts (session, logs)
+  sessionFile: string;           // Path for persisted browser cookies (default: <dataDir>/session.json)
   dryRun: boolean;               // true = monitor only, NEVER purchase
-  logDir: string;                // Directory for audit log files
+  logDir: string;                // Directory for audit log files (default: <dataDir>/logs)
   approvalMethod: ApprovalMethod; // How to gate purchases: terminal stdin or Telegram bot
 }
 
