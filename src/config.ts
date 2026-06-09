@@ -81,6 +81,7 @@ const DEFAULTS: Settings = {
   logDir: path.join(DEFAULT_DATA_DIR, "logs"),
   approvalMethod: "stdin", // Safe default — terminal-based approval
   healthPort: 0,      // 0 = disabled; set to a port between 1024–65535 to enable
+  debugSnapshots: false, // Enable with --debug-dom CLI flag or set true in config
 };
 
 // ---------------------------------------------------------------------------
@@ -179,6 +180,9 @@ function validateSettings(raw: Record<string, unknown>): Settings {
     throw new ConfigValidationError(
       "settings.healthPort must be 0 (disabled) or an integer between 1024 and 65535"
     );
+  }
+  if (typeof merged.debugSnapshots !== "boolean") {
+    throw new ConfigValidationError("settings.debugSnapshots must be a boolean");
   }
 
   return merged;

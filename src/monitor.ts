@@ -8,6 +8,7 @@
  * Halts (returns "anti_bot") if a bot challenge is detected.
  */
 
+import * as path from "path";
 import { Page } from "playwright";
 import { Item, StockCheckResult } from "./types";
 import { Logger } from "./logger";
@@ -16,6 +17,7 @@ import { SELECTORS } from "./selectors";
 import { resolveSelector } from "./selectors";
 import { detectChallenge } from "./auth";
 import { navigateTo } from "./browser-actions";
+import { captureDomSnapshot, describeProductSelectors } from "./diagnostics";
 
 const MODULE = "monitor";
 const LAZADA_DOMAIN = "www.lazada.sg";
@@ -28,7 +30,8 @@ export async function checkStock(
   page: Page,
   item: Item,
   rateLimiter: RateLimiter,
-  logger: Logger
+  logger: Logger,
+  debugDir?: string
 ): Promise<StockCheckResult> {
   const timestamp = new Date().toISOString();
   const base: Omit<StockCheckResult, "status" | "price" | "pageTitle"> = {
@@ -72,6 +75,12 @@ export async function checkStock(
     return { ...base, status: "login_required", price: null, pageTitle };
   }
 
+  // Diagnostics — only when debug mode is active
+  if (debugDir) {
+    await captureDomSnapshot(page, item, debugDir, logger);
+    await describeProductSelectors(page, logger);
+  }
+
   const price = await extractPrice(page, item.name, logger);
   const status = await determineStatus(page, item.name, logger);
 
@@ -94,7 +103,9 @@ export async function waitForStock(
   intervalMs: number,
   rateLimiter: RateLimiter,
   logger: Logger,
-  signal: AbortSignal
+  signal: AbortSignal,
+  debugSnapshots = false,
+  debugDir?: string
 ): Promise<StockCheckResult> {
   logger.info(MODULE, "monitoring_started", {
     item: item.name,
@@ -102,8 +113,13 @@ export async function waitForStock(
     maxPrice: item.maxPrice,
   });
 
+  // Resolve debug dir once — derived from the caller-supplied path or cwd
+  const resolvedDebugDir = debugSnapshots
+    ? (debugDir ?? path.join(process.cwd(), "data", "debug"))
+    : undefined;
+
   while (!signal.aborted) {
-    const result = await checkStock(page, item, rateLimiter, logger);
+    const result = await checkStock(page, item, rateLimiter, logger, resolvedDebugDir);
 
     if (result.status === "anti_bot") {
       logger.error(MODULE, "monitoring_halted_anti_bot", { item: item.name });

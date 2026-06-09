@@ -10,6 +10,7 @@
  * Promise.allSettled is used so a failure on one item does not abort others.
  */
 
+import * as path from "path";
 import { chromium, BrowserContext } from "playwright";
 import * as dotenv from "dotenv";
 import { loadConfig, loadCredentials, loadTelegramCredentials } from "./config";
@@ -29,6 +30,7 @@ import { Item, Config, StockCheckResult } from "./types";
 const args = process.argv.slice(2);
 const CLI_DRY_RUN = args.includes("--dry-run");
 const CLI_VERIFY_SELECTORS = args.includes("--verify-selectors");
+const CLI_DEBUG_DOM = args.includes("--debug-dom");
 
 // ---------------------------------------------------------------------------
 // Per-item worker
@@ -42,7 +44,8 @@ async function runItemWorker(
   logger: Logger,
   signal: AbortSignal,
   itemStatus: ItemStatus,
-  runtimeStatus: RuntimeStatus
+  runtimeStatus: RuntimeStatus,
+  debugDir?: string
 ): Promise<void> {
   const page = await context.newPage();
 
@@ -54,7 +57,9 @@ async function runItemWorker(
       config.settings.checkIntervalMs,
       rateLimiter,
       logger,
-      signal
+      signal,
+      config.settings.debugSnapshots,
+      debugDir
     );
 
     // Update item health metrics after each stock check
@@ -162,6 +167,10 @@ async function main(): Promise<void> {
   if (CLI_DRY_RUN) {
     config.settings.dryRun = true;
   }
+  // Override debugSnapshots from CLI flag
+  if (CLI_DEBUG_DOM) {
+    config.settings.debugSnapshots = true;
+  }
 
   const logger = new Logger(config.settings.logDir);
 
@@ -170,6 +179,7 @@ async function main(): Promise<void> {
     dryRun: config.settings.dryRun,
     headless: config.settings.headless,
     checkIntervalMs: config.settings.checkIntervalMs,
+    debugSnapshots: config.settings.debugSnapshots,
   });
 
   if (config.settings.dryRun) {
@@ -279,6 +289,14 @@ async function main(): Promise<void> {
 
   // ── Item workers ─────────────────────────────────────────────────────────
 
+  const debugDir = config.settings.debugSnapshots
+    ? path.join(config.settings.dataDir, "debug")
+    : undefined;
+
+  if (debugDir) {
+    logger.info("main", "debug_snapshots_enabled", { debugDir });
+  }
+
   logger.info("main", "workers_starting", { items: config.items.map((i) => i.name) });
 
   const workers = config.items.map((item, index) =>
@@ -290,7 +308,8 @@ async function main(): Promise<void> {
       logger,
       controller.signal,
       itemStatuses[index]!,
-      runtimeStatus
+      runtimeStatus,
+      debugDir
     )
   );
 
