@@ -39,7 +39,7 @@ The whole design is shaped by four invariants. None of them are optional:
 ```bash
 # 1. Install
 npm ci
-npx playwright install --with-deps chromium
+npx playwright install --with-deps chromium   # version tied to playwright 1.56.1 in package.json
 
 # 2. Configure
 cp .env.example .env           # fill in LAZADA_EMAIL, LAZADA_PASSWORD
