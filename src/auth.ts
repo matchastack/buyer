@@ -17,7 +17,6 @@ import { fillInput, clickElement, waitForUrl } from "./browser-actions";
 import { captureNamedSnapshot } from "./diagnostics";
 
 const MODULE = "auth";
-const LOGIN_URL = "https://www.lazada.sg/customer/account/login/";
 const HOME_URL = "https://www.lazada.sg/";
 
 // ---------------------------------------------------------------------------
@@ -173,6 +172,7 @@ export async function login(
   page: Page,
   logger: Logger,
   sessionFile: string,
+  loginUrl: string,
   debug?: AuthDebugOptions
 ): Promise<void> {
   if (await isLoggedIn(page, logger)) {
@@ -182,8 +182,8 @@ export async function login(
 
   const credentials = loadCredentials();
 
-  logger.info(MODULE, "login_start");
-  await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 20_000 });
+  logger.info(MODULE, "login_start", { loginUrl });
+  await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
 
   const challenge = await detectChallenge(page, logger);
   if (challenge) throw new ChallengeDetectedError(challenge);
@@ -252,16 +252,17 @@ export async function runAuthDebug(
   page: Page,
   logger: Logger,
   sessionFile: string,
+  loginUrl: string,
   snapshotDir: string,
   pauseMs: number
 ): Promise<boolean> {
-  logger.info(MODULE, "auth_debug_start", { snapshotDir, pauseMs });
+  logger.info(MODULE, "auth_debug_start", { loginUrl, snapshotDir, pauseMs });
 
   // Force a clean logged-out state so the whole login is observable.
   await context.clearCookies();
   logger.info(MODULE, "auth_debug_cookies_cleared");
 
-  await login(context, page, logger, sessionFile, { snapshotDir, pauseMs });
+  await login(context, page, logger, sessionFile, loginUrl, { snapshotDir, pauseMs });
 
   // Confirm the homepage now renders in a logged-in state.
   const loggedIn = await isLoggedIn(page, logger);

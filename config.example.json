@@ -36,6 +36,7 @@
     "challengeBackoffMaxMs": 300000,
     "maxConsecutiveChallenges": 6,
     "monitorMode": "wishlist",
+    "loginUrl": "https://member.lazada.sg/user/login",
     "wishlistUrl": "https://my.lazada.sg/wishlist/index",
     "wishlistPollIntervalMs": 1500,
     "buyMaxRetries": 5,

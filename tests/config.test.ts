@@ -212,6 +212,17 @@ describe("loadConfig", () => {
     expect(() => loadConfig(file)).toThrow(/wishlistUrl/i);
   });
 
+  it("defaults loginUrl to the member.lazada.sg login page", () => {
+    const file = writeTmpConfig(VALID_CONFIG);
+    expect(loadConfig(file).settings.loginUrl).toBe("https://member.lazada.sg/user/login");
+  });
+
+  it("throws when loginUrl is not https", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, loginUrl: "ftp://x" } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/loginUrl/i);
+  });
+
   it("throws when buyRetryMaxMs is below buyRetryBaseMs", () => {
     const bad = {
       ...VALID_CONFIG,

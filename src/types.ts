@@ -64,6 +64,7 @@ export interface Settings {
   stealth: boolean;               // true = inject fingerprint-masking init script to avoid tripping anti-bot
   fastCheckout: boolean;          // true = buy on the already-loaded in-stock page (no re-navigation, no rate-limit wait)
   monitorMode: MonitorMode;       // "per-item" = one PDP poll per item; "wishlist" = one wishlist watcher fans out to buyers
+  loginUrl: string;               // Lazada login page (Lazada moved auth to member.lazada.sg)
   wishlistUrl: string;            // account wishlist page polled by the watcher in wishlist mode
   wishlistPollIntervalMs: number; // poll cadence for the wishlist watcher (ms)
   buyMaxRetries: number;          // wishlist buy-path attempt count (fast OOS retries)

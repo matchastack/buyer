@@ -343,6 +343,7 @@ async function main(): Promise<void> {
         authPage,
         logger,
         config.settings.sessionFile,
+        config.settings.loginUrl,
         snapshotDir,
         AUTH_DEBUG_PAUSE_MS
       );
@@ -363,7 +364,7 @@ async function main(): Promise<void> {
     await loadSession(context, config.settings.sessionFile, logger);
 
     if (!(await isLoggedIn(authPage, logger))) {
-      await login(context, authPage, logger, config.settings.sessionFile);
+      await login(context, authPage, logger, config.settings.sessionFile, config.settings.loginUrl);
     } else {
       logger.info("main", "session_valid_skipping_login");
     }

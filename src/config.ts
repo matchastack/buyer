@@ -95,6 +95,7 @@ const DEFAULTS: Settings = {
   challengeBackoffMaxMs: 300_000,  // Cap challenge backoff at 5 minutes
   maxConsecutiveChallenges: 6,     // Give up after 6 challenges with no good check between
   monitorMode: "per-item",         // Safe default — unchanged behaviour; opt into "wishlist"
+  loginUrl: "https://member.lazada.sg/user/login", // Lazada's current login page (old /customer/account/login 404s)
   wishlistUrl: "https://my.lazada.sg/wishlist/index",
   wishlistPollIntervalMs: 2_000,   // One watcher poll regardless of item count
   buyMaxRetries: 5,                // Fast OOS retries on the buy path (traffic vs sellout)
@@ -229,6 +230,9 @@ function validateSettings(raw: Record<string, unknown>): Settings {
   }
   if (merged.monitorMode !== "wishlist" && merged.monitorMode !== "per-item") {
     throw new ConfigValidationError('settings.monitorMode must be "wishlist" or "per-item"');
+  }
+  if (typeof merged.loginUrl !== "string" || !merged.loginUrl.startsWith("https://")) {
+    throw new ConfigValidationError("settings.loginUrl must be a string starting with https://");
   }
   if (typeof merged.wishlistUrl !== "string" || !merged.wishlistUrl.startsWith("https://")) {
     throw new ConfigValidationError("settings.wishlistUrl must be a string starting with https://");

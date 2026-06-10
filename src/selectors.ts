@@ -70,26 +70,25 @@ export const SELECTORS = {
     } satisfies SelectorSet,
 
     loginLink: {
-      description: "Login link/button in the site header — visible = logged OUT",
+      description: "Login affordance in the site header — visible = logged OUT",
       candidates: [
-        'a[href*="/customer/account/login"]',
-        'a[href*="member/login"]',
-        'a[href*="/login"]',
-        'a:has-text("Login")',
-        'a:has-text("Log In")',
+        '#anonLogin',                 // Lazada header: logged-out "login" link container
+        '#anonLogin a',
+        '#anonSignup',
+        'a[data-spm-click*="locaid=login"]',
+        'a[href*="member.lazada"][href*="login"]',
       ],
       required: false,
     } satisfies SelectorSet,
 
     loggedInIndicator: {
-      description: "Account/avatar affordance in the header — visible = logged IN (positive signal)",
+      description: "Account affordance in the header — visible = logged IN (positive signal)",
       candidates: [
-        '[class*="lzd-site-nav-user"]',
-        '[class*="site-nav-user"]',
-        '[class*="username"]',
-        'a[href*="/customer/account"]:not([href*="login"])',
-        '[class*="account-menu"]',
-        'a:has-text("My Account")',
+        '#myAccountTrigger',                          // account-name trigger, shown only when logged in
+        '#topActionUserAccont:not(.top-links-item-hidden)',
+        'a[href*="member.lazada.sg/user/account"]',
+        'a[href*="member.lazada.sg/user/logout"]',
+        '[data-spm-click*="locaid=account"]',
       ],
       required: false,
     } satisfies SelectorSet,
