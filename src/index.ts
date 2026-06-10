@@ -21,7 +21,8 @@ import { waitForStock } from "./monitor";
 import { shouldProceed, isAntiBot } from "./decision";
 import { checkout } from "./checkout";
 import { startHealthServer, RuntimeStatus, ItemStatus } from "./health";
-import { Item, Config, StockCheckResult } from "./types";
+import { applyStealth } from "./stealth";
+import { Item, Config, StockCheckResult, ChallengeSurvivalOptions } from "./types";
 
 // ---------------------------------------------------------------------------
 // CLI flags
@@ -51,6 +52,13 @@ async function runItemWorker(
 
   try {
     // Monitor until in-stock
+    const survival: ChallengeSurvivalOptions = {
+      surviveChallenges: config.settings.surviveChallenges,
+      challengeBackoffBaseMs: config.settings.challengeBackoffBaseMs,
+      challengeBackoffMaxMs: config.settings.challengeBackoffMaxMs,
+      maxConsecutiveChallenges: config.settings.maxConsecutiveChallenges,
+    };
+
     const result: StockCheckResult = await waitForStock(
       page,
       item,
@@ -58,6 +66,7 @@ async function runItemWorker(
       rateLimiter,
       logger,
       signal,
+      survival,
       config.settings.debugSnapshots,
       debugDir
     );
@@ -97,8 +106,17 @@ async function runItemWorker(
     // Checkout
     logger.info("worker", "starting_checkout", { item: item.name, price: result.price });
 
+    // The monitor leaves `page` on the in-stock product page, so the checkout
+    // can buy from it directly when fastCheckout is enabled — no reload, no wait.
     runtimeStatus.totalCheckoutAttempts++;
-    const checkoutResult = await checkout(page, item, config, rateLimiter, logger);
+    const checkoutResult = await checkout(
+      page,
+      item,
+      config,
+      rateLimiter,
+      logger,
+      config.settings.fastCheckout
+    );
 
     if (checkoutResult.success) {
       runtimeStatus.totalPurchases++;
@@ -212,6 +230,11 @@ async function main(): Promise<void> {
     locale: "en-SG",
     timezoneId: "Asia/Singapore",
   });
+
+  // Mask automation fingerprints before any page loads (avoidance, not bypass).
+  if (config.settings.stealth) {
+    await applyStealth(context, logger);
+  }
 
   const controller = new AbortController();
 

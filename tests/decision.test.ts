@@ -3,6 +3,7 @@ import {
   isPriceAcceptable,
   shouldProceed,
   computeBackoff,
+  computeChallengeBackoff,
   isAntiBot,
   formatOrderSummary,
 } from "../src/decision";
@@ -148,6 +149,44 @@ describe("computeBackoff", () => {
 
   it("includes a reason string", () => {
     const result = computeBackoff(1, 2_000, 30_000, 3);
+    expect(typeof result.reason).toBe("string");
+    expect(result.reason.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeChallengeBackoff
+// ---------------------------------------------------------------------------
+
+describe("computeChallengeBackoff", () => {
+  it("backs off (no give-up) on the first challenge with the base delay", () => {
+    const result = computeChallengeBackoff(1, 30_000, 300_000, 6);
+    expect(result.giveUp).toBe(false);
+    expect(result.delayMs).toBe(30_000); // 30000 * 2^0
+  });
+
+  it("grows the backoff exponentially with each consecutive challenge", () => {
+    expect(computeChallengeBackoff(2, 30_000, 300_000, 6).delayMs).toBe(60_000); // 2^1
+    expect(computeChallengeBackoff(3, 30_000, 300_000, 6).delayMs).toBe(120_000); // 2^2
+  });
+
+  it("caps the backoff at maxDelayMs", () => {
+    const result = computeChallengeBackoff(5, 30_000, 300_000, 10);
+    expect(result.delayMs).toBe(300_000); // 30000 * 2^4 = 480000 → capped
+  });
+
+  it("trips the circuit breaker once the limit is reached", () => {
+    const result = computeChallengeBackoff(6, 30_000, 300_000, 6);
+    expect(result.giveUp).toBe(true);
+    expect(result.delayMs).toBe(0);
+  });
+
+  it("keeps surviving while below the limit", () => {
+    expect(computeChallengeBackoff(5, 30_000, 300_000, 6).giveUp).toBe(false);
+  });
+
+  it("includes a reason string", () => {
+    const result = computeChallengeBackoff(1, 30_000, 300_000, 6);
     expect(typeof result.reason).toBe("string");
     expect(result.reason.length).toBeGreaterThan(0);
   });

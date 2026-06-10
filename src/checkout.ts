@@ -33,7 +33,8 @@ export async function checkout(
   item: Item,
   config: Config,
   rateLimiter: RateLimiter,
-  logger: Logger
+  logger: Logger,
+  alreadyOnProductPage = false
 ): Promise<CheckoutResult> {
   // ── Dry-run guard — must be first ──────────────────────────────────────────
   if (config.settings.dryRun) {
@@ -41,10 +42,13 @@ export async function checkout(
     return { success: false, orderNumber: null, error: "dry-run mode" };
   }
 
-  logger.info(MODULE, "checkout_start", { item: item.name });
+  logger.info(MODULE, "checkout_start", { item: item.name, fastPath: alreadyOnProductPage });
 
   for (let attempt = 1; attempt <= config.settings.maxRetries; attempt++) {
-    const result = await attemptCheckout(page, item, config, rateLimiter, logger, attempt);
+    // Only the very first attempt can act on the live in-stock page. Any retry
+    // means the previous attempt navigated away, so it must reload (and pace).
+    const skipInitialNav = alreadyOnProductPage && attempt === 1;
+    const result = await attemptCheckout(page, item, config, rateLimiter, logger, attempt, skipInitialNav);
 
     if (result.success) return result;
 
@@ -75,11 +79,19 @@ async function attemptCheckout(
   config: Config,
   rateLimiter: RateLimiter,
   logger: Logger,
-  attempt: number
+  attempt: number,
+  skipInitialNav: boolean
 ): Promise<CheckoutResult> {
   try {
-    await rateLimiter.acquire(LAZADA_DOMAIN);
-    await navigateTo(page, item.url, logger);
+    // Fast path: the page is already on the in-stock product page (just seen by
+    // the monitor). Skip the rate-limit wait and re-navigation — every second
+    // here is a second the item can sell out. The QR/Place-Order flow still runs.
+    if (skipInitialNav) {
+      logger.info(MODULE, "fast_path_using_live_page", { item: item.name });
+    } else {
+      await rateLimiter.acquire(LAZADA_DOMAIN);
+      await navigateTo(page, item.url, logger);
+    }
 
     const challenge = await detectChallenge(page, logger);
     if (challenge) throw new ChallengeDetectedError(challenge);

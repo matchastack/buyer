@@ -10,11 +10,12 @@
 
 import * as path from "path";
 import { Page } from "playwright";
-import { Item, StockCheckResult } from "./types";
+import { Item, StockCheckResult, ChallengeSurvivalOptions } from "./types";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
 import { SELECTORS } from "./selectors";
 import { resolveSelector } from "./selectors";
+import { computeChallengeBackoff } from "./decision";
 import { detectChallenge } from "./auth";
 import { navigateTo } from "./browser-actions";
 import { captureDomSnapshot, describeProductSelectors } from "./diagnostics";
@@ -104,6 +105,7 @@ export async function waitForStock(
   rateLimiter: RateLimiter,
   logger: Logger,
   signal: AbortSignal,
+  survival: ChallengeSurvivalOptions,
   debugSnapshots = false,
   debugDir?: string
 ): Promise<StockCheckResult> {
@@ -111,6 +113,7 @@ export async function waitForStock(
     item: item.name,
     intervalMs,
     maxPrice: item.maxPrice,
+    surviveChallenges: survival.surviveChallenges,
   });
 
   // Resolve debug dir once — derived from the caller-supplied path or cwd
@@ -118,18 +121,54 @@ export async function waitForStock(
     ? (debugDir ?? path.join(process.cwd(), "data", "debug"))
     : undefined;
 
+  // Tracks the current run of back-to-back challenges; reset by any good check.
+  let consecutiveChallenges = 0;
+
   while (!signal.aborted) {
     const result = await checkStock(page, item, rateLimiter, logger, resolvedDebugDir);
 
     if (result.status === "anti_bot") {
-      logger.error(MODULE, "monitoring_halted_anti_bot", { item: item.name });
-      return result; // caller inspects status and handles accordingly
+      // Fail-closed (legacy) behaviour: hand control back to the caller.
+      if (!survival.surviveChallenges) {
+        logger.error(MODULE, "monitoring_halted_anti_bot", { item: item.name });
+        return result;
+      }
+
+      // Survival mode: back off and resume so a single challenge does not end
+      // the 2-hour watch. A circuit breaker stops an endless hammering loop.
+      consecutiveChallenges++;
+      const backoff = computeChallengeBackoff(
+        consecutiveChallenges,
+        survival.challengeBackoffBaseMs,
+        survival.challengeBackoffMaxMs,
+        survival.maxConsecutiveChallenges
+      );
+
+      if (backoff.giveUp) {
+        logger.error(MODULE, "monitoring_halted_anti_bot_circuit_breaker", {
+          item: item.name,
+          consecutiveChallenges,
+          reason: backoff.reason,
+        });
+        return result;
+      }
+
+      logger.warn(MODULE, "anti_bot_backoff_resume", {
+        item: item.name,
+        consecutiveChallenges,
+        backoffMs: backoff.delayMs,
+      });
+      await interruptibleSleep(backoff.delayMs, signal);
+      continue;
     }
 
     if (result.status === "login_required") {
       logger.error(MODULE, "monitoring_halted_login_expired", { item: item.name });
       return result;
     }
+
+    // A clean check ends any challenge streak.
+    consecutiveChallenges = 0;
 
     if (result.status === "in_stock") {
       logger.info(MODULE, "item_available", { item: item.name, price: result.price });

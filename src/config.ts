@@ -82,6 +82,12 @@ const DEFAULTS: Settings = {
   approvalMethod: "stdin", // Safe default — terminal-based approval
   healthPort: 0,      // 0 = disabled; set to a port between 1024–65535 to enable
   debugSnapshots: false, // Enable with --debug-dom CLI flag or set true in config
+  stealth: true,      // Mask automation fingerprints to reduce anti-bot challenges
+  fastCheckout: true, // Buy on the live in-stock page — no re-navigation, no rate-limit wait
+  surviveChallenges: true, // Back off and resume monitoring on a challenge instead of halting
+  challengeBackoffBaseMs: 30_000,  // First challenge backoff (grows exponentially)
+  challengeBackoffMaxMs: 300_000,  // Cap challenge backoff at 5 minutes
+  maxConsecutiveChallenges: 6,     // Give up after 6 challenges with no good check between
 };
 
 // ---------------------------------------------------------------------------
@@ -183,6 +189,28 @@ function validateSettings(raw: Record<string, unknown>): Settings {
   }
   if (typeof merged.debugSnapshots !== "boolean") {
     throw new ConfigValidationError("settings.debugSnapshots must be a boolean");
+  }
+  if (typeof merged.stealth !== "boolean") {
+    throw new ConfigValidationError("settings.stealth must be a boolean");
+  }
+  if (typeof merged.fastCheckout !== "boolean") {
+    throw new ConfigValidationError("settings.fastCheckout must be a boolean");
+  }
+  if (typeof merged.surviveChallenges !== "boolean") {
+    throw new ConfigValidationError("settings.surviveChallenges must be a boolean");
+  }
+  if (merged.challengeBackoffBaseMs < 1_000) {
+    throw new ConfigValidationError("settings.challengeBackoffBaseMs must be >= 1000ms");
+  }
+  if (merged.challengeBackoffMaxMs < merged.challengeBackoffBaseMs) {
+    throw new ConfigValidationError(
+      "settings.challengeBackoffMaxMs must be >= challengeBackoffBaseMs"
+    );
+  }
+  if (!Number.isInteger(merged.maxConsecutiveChallenges) || merged.maxConsecutiveChallenges < 1) {
+    throw new ConfigValidationError(
+      "settings.maxConsecutiveChallenges must be an integer >= 1"
+    );
   }
 
   return merged;

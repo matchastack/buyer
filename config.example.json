@@ -27,6 +27,12 @@
     "healthPort": 0,
     "dataDir": "data",
     "approvalMethod": "stdin",
-    "debugSnapshots": false
+    "debugSnapshots": false,
+    "stealth": true,
+    "fastCheckout": true,
+    "surviveChallenges": true,
+    "challengeBackoffBaseMs": 30000,
+    "challengeBackoffMaxMs": 300000,
+    "maxConsecutiveChallenges": 6
   }
 }

@@ -50,6 +50,20 @@ export interface Settings {
   approvalMethod: ApprovalMethod; // How to gate purchases: terminal stdin or Telegram bot
   healthPort: number;             // 0 = disabled; 1024–65535 = bind health HTTP server on 127.0.0.1
   debugSnapshots: boolean;        // true = write DOM snapshots + selector report to <dataDir>/debug on each check
+  stealth: boolean;               // true = inject fingerprint-masking init script to avoid tripping anti-bot
+  fastCheckout: boolean;          // true = buy on the already-loaded in-stock page (no re-navigation, no rate-limit wait)
+  surviveChallenges: boolean;     // true = back off and resume monitoring on an anti-bot challenge instead of halting
+  challengeBackoffBaseMs: number; // base backoff after a monitoring-phase challenge (ms)
+  challengeBackoffMaxMs: number;  // cap for monitoring-phase challenge backoff (ms)
+  maxConsecutiveChallenges: number; // circuit breaker: give up after this many challenges with no successful check between
+}
+
+// Options controlling how the monitor reacts to anti-bot challenges.
+export interface ChallengeSurvivalOptions {
+  surviveChallenges: boolean;
+  challengeBackoffBaseMs: number;
+  challengeBackoffMaxMs: number;
+  maxConsecutiveChallenges: number;
 }
 
 export interface Config {

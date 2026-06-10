@@ -92,6 +92,43 @@ export function isAntiBot(status: StockStatus): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Challenge-survival backoff
+// ---------------------------------------------------------------------------
+
+export interface ChallengeBackoffResult {
+  giveUp: boolean;  // true ⇒ circuit breaker tripped, stop monitoring
+  delayMs: number;  // how long to wait before the next check (0 when giving up)
+  reason: string;
+}
+
+/**
+ * Decides whether to keep monitoring after an anti-bot challenge and, if so,
+ * how long to back off. `consecutiveChallenges` is 1-indexed: 1 = the first
+ * challenge in the current streak (a successful check resets the streak).
+ * Backoff grows exponentially from the first challenge and is capped.
+ */
+export function computeChallengeBackoff(
+  consecutiveChallenges: number,
+  baseDelayMs: number,
+  maxDelayMs: number,
+  maxConsecutive: number
+): ChallengeBackoffResult {
+  if (consecutiveChallenges >= maxConsecutive) {
+    return {
+      giveUp: true,
+      delayMs: 0,
+      reason: `Circuit breaker: ${consecutiveChallenges} consecutive challenge(s) reached limit of ${maxConsecutive}`,
+    };
+  }
+  const delayMs = Math.min(baseDelayMs * Math.pow(2, consecutiveChallenges - 1), maxDelayMs);
+  return {
+    giveUp: false,
+    delayMs,
+    reason: `Challenge ${consecutiveChallenges}/${maxConsecutive} — backing off ${delayMs}ms then resuming`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Order summary formatter (for terminal display)
 // ---------------------------------------------------------------------------
 
