@@ -47,6 +47,7 @@ export interface Settings {
   dryRun: boolean;               // true = monitor only, NEVER purchase
   logDir: string;                // Directory for audit log files
   approvalMethod: ApprovalMethod; // How to gate purchases: terminal stdin or Telegram bot
+  workerStartDelayMs: number;     // Extra delay multiplied by worker index before first navigation (ms)
 }
 
 export interface Config {

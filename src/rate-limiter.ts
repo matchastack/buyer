@@ -3,18 +3,19 @@
  *
  * Enforces a minimum interval between requests to the same domain,
  * plus random jitter to avoid machine-like request patterns.
+ *
+ * Concurrent callers for the same domain are serialised via a promise
+ * chain so they never overlap, regardless of how many workers call
+ * acquire() simultaneously.
  */
 
 import { RateLimiterOptions } from "./types";
 
-interface DomainState {
-  lastUsedMs: number;
-}
-
 export class RateLimiter {
   private readonly minIntervalMs: number;
   private readonly maxJitterMs: number;
-  private readonly state = new Map<string, DomainState>();
+  private readonly queues = new Map<string, Promise<void>>();
+  private readonly lastUsed = new Map<string, number>();
 
   constructor(options: RateLimiterOptions) {
     this.minIntervalMs = options.minIntervalMs;
@@ -23,42 +24,36 @@ export class RateLimiter {
 
   /**
    * Waits until a request to `domain` is permitted, then marks the slot used.
-   * The effective wait = max(0, minIntervalMs - elapsed) + jitter.
+   * Each caller chains off the previous caller's slot, so concurrent callers
+   * are serialised and spaced at least minIntervalMs + jitter apart.
    */
   async acquire(domain: string): Promise<void> {
-    const now = Date.now();
-    const prev = this.state.get(domain);
     const jitter = Math.floor(Math.random() * this.maxJitterMs);
+    const waitMs = this.minIntervalMs + jitter;
 
-    let waitMs = jitter;
-    if (prev !== undefined) {
-      const elapsed = now - prev.lastUsedMs;
-      const remaining = this.minIntervalMs - elapsed;
-      if (remaining > 0) {
-        waitMs += remaining;
-      }
-    }
+    const prev = this.queues.get(domain) ?? Promise.resolve();
+    const next = prev.then(() => delay(waitMs));
+    this.queues.set(domain, next);
+    await next;
 
-    if (waitMs > 0) {
-      await delay(waitMs);
-    }
-
-    this.state.set(domain, { lastUsedMs: Date.now() });
+    this.lastUsed.set(domain, Date.now());
   }
 
   /** Reset state for a domain (used in tests). */
   reset(domain: string): void {
-    this.state.delete(domain);
+    this.queues.delete(domain);
+    this.lastUsed.delete(domain);
   }
 
   /** Reset all domain state. */
   resetAll(): void {
-    this.state.clear();
+    this.queues.clear();
+    this.lastUsed.clear();
   }
 
-  /** Returns the timestamp (ms) of the last request to `domain`, or null. */
+  /** Returns the timestamp (ms) of the last completed request to `domain`, or null. */
   getLastUsed(domain: string): number | null {
-    return this.state.get(domain)?.lastUsedMs ?? null;
+    return this.lastUsed.get(domain) ?? null;
   }
 }
 

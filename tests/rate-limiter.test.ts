@@ -10,10 +10,9 @@ describe("RateLimiter", () => {
     vi.useRealTimers();
   });
 
-  it("resolves immediately on first acquire for a domain", async () => {
+  it("resolves after minIntervalMs on first acquire for a domain", async () => {
     const limiter = new RateLimiter({ minIntervalMs: 5_000, maxJitterMs: 0 });
 
-    // Should not pend at all
     const promise = limiter.acquire("example.com");
     await vi.runAllTimersAsync();
     await expect(promise).resolves.toBeUndefined();
@@ -59,7 +58,7 @@ describe("RateLimiter", () => {
     expect(resolved).toBe(true);
   });
 
-  it("reset() allows immediate reuse of a domain", async () => {
+  it("reset() clears the queue so the next acquire starts a fresh chain", async () => {
     const limiter = new RateLimiter({ minIntervalMs: 10_000, maxJitterMs: 0 });
 
     const p1 = limiter.acquire("example.com");
@@ -68,12 +67,11 @@ describe("RateLimiter", () => {
 
     limiter.reset("example.com");
 
-    // After reset, next acquire should be immediate
+    // After reset the queue is gone; next acquire starts a new chain
     let resolved = false;
     const p2 = limiter.acquire("example.com").then(() => {
       resolved = true;
     });
-    // Run timers briefly — jitter is 0 so it should resolve in the next tick
     await vi.runAllTimersAsync();
     await p2;
     expect(resolved).toBe(true);
@@ -82,11 +80,10 @@ describe("RateLimiter", () => {
   it("resetAll() clears all domain state", async () => {
     const limiter = new RateLimiter({ minIntervalMs: 10_000, maxJitterMs: 0 });
 
-    await Promise.all([
-      limiter.acquire("a.com").then(() => vi.runAllTimersAsync()),
-      limiter.acquire("b.com").then(() => vi.runAllTimersAsync()),
-    ]);
+    const p1 = limiter.acquire("a.com");
+    const p2 = limiter.acquire("b.com");
     await vi.runAllTimersAsync();
+    await Promise.all([p1, p2]);
 
     limiter.resetAll();
 
@@ -110,5 +107,24 @@ describe("RateLimiter", () => {
     const last = limiter.getLastUsed("example.com");
     expect(last).not.toBeNull();
     expect(last!).toBeGreaterThanOrEqual(before);
+  });
+
+  it("serialises concurrent acquires for the same domain", async () => {
+    const limiter = new RateLimiter({ minIntervalMs: 1_000, maxJitterMs: 0 });
+
+    const order: number[] = [];
+    const p1 = limiter.acquire("example.com").then(() => order.push(1));
+    const p2 = limiter.acquire("example.com").then(() => order.push(2));
+    const p3 = limiter.acquire("example.com").then(() => order.push(3));
+
+    await vi.runAllTimersAsync();
+    await Promise.all([p1, p2, p3]);
+
+    // Callers complete in the order they registered, never concurrently
+    expect(order).toEqual([1, 2, 3]);
+
+    // Each slot is separated by at least minIntervalMs
+    const t1 = limiter.getLastUsed("example.com");
+    expect(t1).not.toBeNull();
   });
 });

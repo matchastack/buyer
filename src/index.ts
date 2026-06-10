@@ -31,6 +31,19 @@ const CLI_DRY_RUN = args.includes("--dry-run");
 const CLI_VERIFY_SELECTORS = args.includes("--verify-selectors");
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Resolves after `ms` milliseconds, or immediately if the signal is aborted. */
+function startupDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (ms <= 0 || signal.aborted) { resolve(); return; }
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Per-item worker
 // ---------------------------------------------------------------------------
 
@@ -258,10 +271,20 @@ async function main(): Promise<void> {
 
   // ── Item workers ─────────────────────────────────────────────────────────
 
-  logger.info("main", "workers_starting", { items: config.items.map((i) => i.name) });
+  logger.info("main", "workers_starting", {
+    items: config.items.map((i) => i.name),
+    workerStartDelayMs: config.settings.workerStartDelayMs,
+  });
 
-  const workers = config.items.map((item) =>
-    runItemWorker(item, config, context, rateLimiter, logger, controller.signal)
+  const workers = config.items.map((item, index) =>
+    (async () => {
+      const staggerMs = index * config.settings.workerStartDelayMs;
+      if (staggerMs > 0) {
+        logger.info("main", "worker_startup_stagger", { item: item.name, delayMs: staggerMs });
+        await startupDelay(staggerMs, controller.signal);
+      }
+      await runItemWorker(item, config, context, rateLimiter, logger, controller.signal);
+    })()
   );
 
   const results = await Promise.allSettled(workers);

@@ -77,6 +77,7 @@ const DEFAULTS: Settings = {
   dryRun: true,       // Safe default — must explicitly set false to enable purchases
   logDir: "logs",
   approvalMethod: "stdin", // Safe default — terminal-based approval
+  workerStartDelayMs: 0,  // 0 = no stagger; set to e.g. 5000 to stagger worker startup
 };
 
 // ---------------------------------------------------------------------------
@@ -160,6 +161,13 @@ function validateSettings(raw: Record<string, unknown>): Settings {
     throw new ConfigValidationError(
       'settings.approvalMethod must be "stdin" or "telegram"'
     );
+  }
+  if (
+    typeof merged.workerStartDelayMs !== "number" ||
+    !Number.isFinite(merged.workerStartDelayMs) ||
+    merged.workerStartDelayMs < 0
+  ) {
+    throw new ConfigValidationError("settings.workerStartDelayMs must be a non-negative number");
   }
 
   return merged;
