@@ -67,9 +67,14 @@ export function loadTelegramCredentials(): TelegramCredentials {
 const DEFAULT_DATA_DIR = "data";
 
 const DEFAULTS: Settings = {
-  checkIntervalMs: 15_000,
-  minPageLoadDelayMs: 3_000,
-  maxPageLoadDelayMs: 8_000,
+  // Aggressive by default: this tool exists to win a sub-3s restock window, so
+  // it polls fast and paces loosely. Dry-run (also default) is the safety net;
+  // stealth + challenge survival absorb the higher detection risk. Raise these
+  // for a calmer, lower-risk watch.
+  checkIntervalMs: 2_000,
+  pollSettleMs: 1_500,
+  minPageLoadDelayMs: 800,
+  maxPageLoadDelayMs: 1_800,
   headless: false,
   maxRetries: 3,
   retryBackoffBaseMs: 2_000,
@@ -157,11 +162,14 @@ function validateSettings(raw: Record<string, unknown>): Settings {
     ...raw,
   } as Settings;
 
-  if (merged.checkIntervalMs < 5_000) {
-    throw new ConfigValidationError("settings.checkIntervalMs must be >= 5000ms to avoid rate-limiting");
+  if (merged.checkIntervalMs < 1_000) {
+    throw new ConfigValidationError("settings.checkIntervalMs must be >= 1000ms");
   }
-  if (merged.minPageLoadDelayMs < 1_000) {
-    throw new ConfigValidationError("settings.minPageLoadDelayMs must be >= 1000ms");
+  if (typeof merged.pollSettleMs !== "number" || merged.pollSettleMs < 0) {
+    throw new ConfigValidationError("settings.pollSettleMs must be a number >= 0");
+  }
+  if (merged.minPageLoadDelayMs < 250) {
+    throw new ConfigValidationError("settings.minPageLoadDelayMs must be >= 250ms");
   }
   if (merged.maxPageLoadDelayMs < merged.minPageLoadDelayMs) {
     throw new ConfigValidationError(

@@ -160,10 +160,39 @@ describe("loadConfig", () => {
     expect(() => loadConfig(file)).toThrow(/quantity/i);
   });
 
-  it("throws when checkIntervalMs is below 5000", () => {
-    const bad = { ...VALID_CONFIG, settings: { checkIntervalMs: 1_000, dryRun: true } };
+  it("throws when checkIntervalMs is below 1000", () => {
+    const bad = { ...VALID_CONFIG, settings: { checkIntervalMs: 500, dryRun: true } };
     const file = writeTmpConfig(bad);
     expect(() => loadConfig(file)).toThrow(/checkIntervalMs/i);
+  });
+
+  it("accepts an aggressive checkIntervalMs at the 1000ms floor", () => {
+    const cfg = { ...VALID_CONFIG, settings: { checkIntervalMs: 1_000, dryRun: true } };
+    const file = writeTmpConfig(cfg);
+    expect(loadConfig(file).settings.checkIntervalMs).toBe(1_000);
+  });
+
+  it("defaults pollSettleMs when not specified", () => {
+    const file = writeTmpConfig(VALID_CONFIG);
+    expect(loadConfig(file).settings.pollSettleMs).toBeGreaterThan(0);
+  });
+
+  it("accepts pollSettleMs = 0 (skip settle entirely)", () => {
+    const cfg = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, pollSettleMs: 0 } };
+    const file = writeTmpConfig(cfg);
+    expect(loadConfig(file).settings.pollSettleMs).toBe(0);
+  });
+
+  it("throws when pollSettleMs is negative", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, pollSettleMs: -1 } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/pollSettleMs/i);
+  });
+
+  it("throws when minPageLoadDelayMs is below 250", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, minPageLoadDelayMs: 100 } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/minPageLoadDelayMs/i);
   });
 
   it("throws for unknown settings key", () => {

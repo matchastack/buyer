@@ -36,6 +36,7 @@ export interface Item {
 
 export interface Settings {
   checkIntervalMs: number;       // Base poll interval per item (ms)
+  pollSettleMs: number;          // Max wait for the page to render before evaluating a check (ms); adaptive, returns early
   minPageLoadDelayMs: number;    // Minimum delay between page loads (rate limiting)
   maxPageLoadDelayMs: number;    // Maximum delay (adds random jitter up to this)
   headless: boolean;             // false = visible browser (needed for manual CAPTCHA)

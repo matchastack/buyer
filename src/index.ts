@@ -67,6 +67,7 @@ async function runItemWorker(
       logger,
       signal,
       survival,
+      config.settings.pollSettleMs,
       config.settings.debugSnapshots,
       debugDir
     );

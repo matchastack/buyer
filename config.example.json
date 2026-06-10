@@ -15,9 +15,10 @@
   ],
   "settings": {
     "dryRun": true,
-    "checkIntervalMs": 15000,
-    "minPageLoadDelayMs": 4000,
-    "maxPageLoadDelayMs": 9000,
+    "checkIntervalMs": 1500,
+    "pollSettleMs": 1200,
+    "minPageLoadDelayMs": 500,
+    "maxPageLoadDelayMs": 1200,
     "headless": false,
     "maxRetries": 3,
     "retryBackoffBaseMs": 2000,

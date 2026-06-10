@@ -32,6 +32,7 @@ export async function checkStock(
   item: Item,
   rateLimiter: RateLimiter,
   logger: Logger,
+  settleMs: number,
   debugDir?: string
 ): Promise<StockCheckResult> {
   const timestamp = new Date().toISOString();
@@ -54,8 +55,12 @@ export async function checkStock(
     return { ...base, status: "unknown", price: null, pageTitle: null };
   }
 
-  // Brief pause for dynamic JS content to settle
-  await page.waitForTimeout(1_500);
+  // Adaptive settle: proceed as soon as the price anchor renders (or any
+  // product anchor), capped at settleMs. This replaces a blind fixed wait so a
+  // fast-rendering page is evaluated in a few hundred ms instead of always
+  // burning the full settle — the difference that lets the poll cadence sit
+  // under the ~3s restock window.
+  await waitForProductReady(page, settleMs);
 
   const pageTitle = await page.title().catch(() => null);
 
@@ -106,12 +111,14 @@ export async function waitForStock(
   logger: Logger,
   signal: AbortSignal,
   survival: ChallengeSurvivalOptions,
+  settleMs: number,
   debugSnapshots = false,
   debugDir?: string
 ): Promise<StockCheckResult> {
   logger.info(MODULE, "monitoring_started", {
     item: item.name,
     intervalMs,
+    settleMs,
     maxPrice: item.maxPrice,
     surviveChallenges: survival.surviveChallenges,
   });
@@ -125,7 +132,7 @@ export async function waitForStock(
   let consecutiveChallenges = 0;
 
   while (!signal.aborted) {
-    const result = await checkStock(page, item, rateLimiter, logger, resolvedDebugDir);
+    const result = await checkStock(page, item, rateLimiter, logger, settleMs, resolvedDebugDir);
 
     if (result.status === "anti_bot") {
       // Fail-closed (legacy) behaviour: hand control back to the caller.
@@ -199,6 +206,25 @@ export async function waitForStock(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Waits until the product page has rendered enough to evaluate, bounded by
+ * `settleMs`. Returns as soon as the price anchor becomes visible; falls
+ * through (no throw) on timeout so `determineStatus` still runs on whatever
+ * did render. `settleMs <= 0` skips waiting entirely (fastest, riskiest).
+ */
+async function waitForProductReady(page: Page, settleMs: number): Promise<void> {
+  if (settleMs <= 0) return;
+  // price candidates are plain CSS — safe to union into one locator.
+  const anchor = SELECTORS.product.price.candidates.join(", ");
+  await page
+    .locator(anchor)
+    .first()
+    .waitFor({ state: "visible", timeout: settleMs })
+    .catch(() => {
+      /* not rendered within settleMs — proceed and let determineStatus decide */
+    });
+}
 
 async function extractPrice(
   page: Page,
