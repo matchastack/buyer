@@ -82,6 +82,7 @@ const DEFAULTS: Settings = {
   approvalMethod: "stdin", // Safe default — terminal-based approval
   healthPort: 0,      // 0 = disabled; set to a port between 1024–65535 to enable
   debugSnapshots: false, // Enable with --debug-dom CLI flag or set true in config
+  workerStartDelayMs: 0,  // 0 = no stagger; set to e.g. 5000 to stagger worker startup
 };
 
 // ---------------------------------------------------------------------------
@@ -183,6 +184,13 @@ function validateSettings(raw: Record<string, unknown>): Settings {
   }
   if (typeof merged.debugSnapshots !== "boolean") {
     throw new ConfigValidationError("settings.debugSnapshots must be a boolean");
+  }
+  if (
+    typeof merged.workerStartDelayMs !== "number" ||
+    !Number.isFinite(merged.workerStartDelayMs) ||
+    merged.workerStartDelayMs < 0
+  ) {
+    throw new ConfigValidationError("settings.workerStartDelayMs must be a non-negative number");
   }
 
   return merged;

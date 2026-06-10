@@ -47,7 +47,7 @@ config + env  ──►  auth (load/restore session, login if needed)
 
 - **`index.ts`** — Calls `dotenv.config()` to load `.env`, validates config, launches Chromium with anti-automation flags, restores session, spawns one `runItemWorker` per item. SIGINT/SIGTERM trigger graceful shutdown that saves session and closes browser.
 - **`config.ts`** — Loads + validates `config.json`. `loadCredentials()` is the only path to env-var credentials and throws if missing. Strict key allow-listing — unknown keys throw. `dryRun` defaults to `true`.
-- **`auth.ts`** — Session cookies persisted to disk with mode `0o600`. `detectChallenge` checks URL patterns (`/baxia/`, `/block`, `/robot`, `captcha`, `/cdn-cgi/challenge-platform/`, `/awswaf/`, `/sec/`) and DOM markers (captcha frames, slider, rate-limit pages). Any challenge throws `ChallengeDetectedError` — the script never attempts to solve CAPTCHAs, MFA, or rate limits.
+- **`auth.ts`** — Session cookies persisted to disk with mode `0o600`. `detectChallenge` checks URL patterns (`/baxia/`, `/block`, `/robot`, `captcha`, `/cdn-cgi/challenge-platform/`, `/awswaf/`, `/sec/`) and DOM markers (captcha frames, slider, rate-limit pages). Any challenge throws `ChallengeDetectedError`.
 - **`monitor.ts`** — `waitForStock` polls a product page at `checkIntervalMs` with an interruptible sleep (checks `AbortSignal` every 500ms). Never throws on transient page errors; returns `StockCheckResult` with status `unknown` so the caller decides. Returns immediately on `anti_bot` or `login_required` so the worker can bail out.
 - **`decision.ts`** — **Pure functions only.** No I/O, no Playwright, no fs, no console. `shouldProceed`, `isPriceAcceptable`, `computeBackoff`, `formatOrderSummary`. Keep this discipline — these are the unit-test core. Note: `isPriceAcceptable(null, …)` returns `true` (unknown price is not a skip reason — the user controls payment via the PayNow QR).
 - **`checkout.ts`** — **Dry-run guard is the first check** (before any navigation). Clicks **Buy Now** only — returns failure immediately if the button is not visible (no Add to Cart fallback). Selects PayNow on the checkout page, then clicks Place Order. Lazada shows a PayNow QR; the user scans it to complete payment. Retries with exponential backoff (`retryBackoffBaseMs * 2^attempt`, capped at `retryBackoffMaxMs`). `ChallengeDetectedError` is re-thrown so `index.ts` shuts down.
@@ -63,7 +63,6 @@ config + env  ──►  auth (load/restore session, login if needed)
 
 - **Credentials never touch `config.json` or logs.** `config.ts` rejects credential keys at the top level. After login, `auth.ts` overwrites the in-memory password string immediately.
 - **Dry-run defaults to true** at both `DEFAULTS` (config.ts) and the example config. Live purchases require explicitly setting `"dryRun": false` AND not passing `--dry-run`. CLI flag always wins (force-enables dry-run).
-- **Anti-bot detection is fail-closed:** a detected challenge halts the worker (in monitor) or aborts shutdown (during login). Do not add retry/wait logic that "powers through" a CAPTCHA.
 - **Selector additions go through the abstraction.** Don't inline `page.locator("…")` calls outside `selectors.ts`/`browser-actions.ts`. Add a new `SelectorSet` to the relevant group in `SELECTORS` with multiple candidates and pick the right `required` flag.
 - **Payment is always PayNow.** `checkout.ts` hardcodes the method to `"paynow"` regardless of config. Lazada displays a QR code after Place Order is clicked; the user scans it to transfer funds. This is the final human confirmation step.
 - Tests run against pure logic (`decision`, `rate-limiter`, `config`). There are no Playwright/integration tests — exercise UI changes manually via `verify-selectors` and headed `dev:dry-run`.
@@ -77,3 +76,13 @@ config + env  ──►  auth (load/restore session, login if needed)
   - `data/logs/audit-YYYY-MM-DD.log` — JSONL audit trail
   - `data/debug/<item>-<timestamp>.png` / `.html` — DOM snapshots (only when `--debug-dom` is active)
 - `dist/` — tsc output
+
+## Development workflow
+
+For every task:
+
+1. Sync the feature branch with the latest `main`: `git fetch origin main && git merge origin/main`
+2. Complete the task
+3. Update all relevant documentation (CLAUDE.md, inline comments, config.example.json)
+4. Sync with `main` again and resolve any merge conflicts before pushing
+5. Create a pull request
