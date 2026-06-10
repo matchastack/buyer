@@ -70,3 +70,13 @@ config + env  ──►  auth (load/restore session, login if needed)
 - `session.json` — persisted cookies (mode 0600)
 - `logs/audit-YYYY-MM-DD.log` — JSONL audit trail
 - `dist/` — tsc output
+
+## Development workflow
+
+For every task:
+
+1. Sync the feature branch with the latest `main`: `git fetch origin main && git merge origin/main`
+2. Complete the task
+3. Update all relevant documentation (CLAUDE.md, inline comments, config.example.json)
+4. Sync with `main` again and resolve any merge conflicts before pushing
+5. Create a pull request
