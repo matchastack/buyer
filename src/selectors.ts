@@ -13,7 +13,7 @@
  * are more resilient to class-name changes but slower to match.
  */
 
-import { Page, Locator } from "playwright";
+import { Page } from "playwright";
 import { SelectorSet, ResolvedSelector } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -183,56 +183,9 @@ export const SELECTORS = {
     } satisfies SelectorSet,
   },
 
-  // ---- Account wishlist page (wishlist monitor mode) -----------------------
-  // UNVERIFIED against live Lazada — run `npm run verify-selectors` (it opens the
-  // wishlist URL and reports matches) before trusting these for a live drop.
-  // The live page groups cards under "Watchlist" (in stock, with an Add to Cart
-  // button) and "Out of Stock" (greyed, "NOT AVAILABLE" overlay, no Add to Cart).
-  wishlist: {
-    cardList: {
-      description: "A wishlist item card (container). Used as the adaptive-settle anchor and iterated for classification.",
-      candidates: [
-        '[class*="wishlist"] [class*="item"]',
-        '[class*="favorite"] [class*="card"]',
-        '[data-spm*="wishlist"] [class*="item"]',
-        '[class*="Wishlist"] [class*="item"]',
-      ],
-      required: false,
-    } satisfies SelectorSet,
-
-    cardProductLink: {
-      description: "Anchor inside a wishlist card linking to the PDP (href carries -i<digits>.html)",
-      candidates: [
-        'a[href*="/products/"]',
-        'a[href*="-i"][href*=".html"]',
-        'a[href*="lazada.sg"]',
-      ],
-      required: false,
-    } satisfies SelectorSet,
-
-    cardAddToCart: {
-      description: "Enabled Add to Cart button on a wishlist card — presence ⇒ in stock",
-      candidates: [
-        'button[data-spm-click*="cart"]:not([disabled])',
-        'button[class*="add-to-cart"]:not([disabled])',
-        'button:has-text("Add to Cart"):not([disabled])',
-      ],
-      required: false,
-    } satisfies SelectorSet,
-
-    cardOutOfStock: {
-      description: "Out-of-stock marker on a wishlist card (NOT AVAILABLE overlay / sold-out)",
-      candidates: [
-        ':has-text("NOT AVAILABLE")',
-        ':has-text("Out of Stock")',
-        ':has-text("Sold Out")',
-        '[class*="sold-out"]',
-        '[class*="out-of-stock"]',
-        'button:has-text("Notify Me")',
-      ],
-      required: false,
-    } satisfies SelectorSet,
-  },
+  // NOTE: wishlist stock state is NOT scraped from the DOM. The watcher parses
+  // the JSON Lazada embeds in the served wishlist HTML (lightItemDetailDTO /
+  // outOfStock arrays) via decision.parseWishlistStock — no selectors needed.
 
   // ---- Cart page -----------------------------------------------------------
   cart: {
@@ -365,34 +318,6 @@ export async function resolveSelector(
       }
     } catch {
       // Selector timed out or threw — try next candidate
-    }
-  }
-
-  if (selectorSet.required) {
-    throw new SelectorNotFoundError(selectorSet.description, selectorSet.candidates);
-  }
-  return null;
-}
-
-/**
- * Like resolveSelector but scoped to a sub-tree (e.g. a single wishlist card)
- * instead of the whole page. Keeps per-card matching inside the abstraction
- * layer rather than inlining page.locator() in business logic.
- */
-export async function resolveSelectorWithin(
-  scope: Locator,
-  selectorSet: SelectorSet,
-  timeoutMs = 2000
-): Promise<ResolvedSelector | null> {
-  for (let i = 0; i < selectorSet.candidates.length; i++) {
-    const candidate = selectorSet.candidates[i]!;
-    try {
-      const visible = await scope.locator(candidate).first().isVisible({ timeout: timeoutMs });
-      if (visible) {
-        return { selector: candidate, candidateIndex: i };
-      }
-    } catch {
-      // try next candidate
     }
   }
 

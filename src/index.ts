@@ -20,7 +20,7 @@ import { loadSession, login, saveSession, isLoggedIn, runAuthDebug, ChallengeDet
 import { waitForStock } from "./monitor";
 import { watchWishlist } from "./wishlist-monitor";
 import { RestockRegistry, RestockGate } from "./restock-signal";
-import { shouldProceed, isAntiBot, extractProductId } from "./decision";
+import { shouldProceed, isAntiBot, extractProductId, parseWishlistStock } from "./decision";
 import { checkout } from "./checkout";
 import { navigateTo } from "./browser-actions";
 import { startHealthServer, RuntimeStatus, ItemStatus } from "./health";
@@ -219,8 +219,8 @@ async function verifySelectors(
   const page = await context.newPage();
 
   try {
-    logger.info("verify", "checking_login_page_selectors");
-    await page.goto("https://www.lazada.sg/customer/account/login/", {
+    logger.info("verify", "checking_login_page_selectors", { url: config.settings.loginUrl });
+    await page.goto(config.settings.loginUrl, {
       waitUntil: "domcontentloaded",
       timeout: 20_000,
     });
@@ -236,11 +236,26 @@ async function verifySelectors(
       logger.info("verify", "product_selector_results", { results: productResults });
     }
 
-    logger.info("verify", "checking_wishlist_page_selectors", { url: config.settings.wishlistUrl });
+    // Wishlist mode reads embedded JSON, not DOM selectors — verify the payload
+    // parses and that each configured item is matchable by its product id.
+    logger.info("verify", "checking_wishlist_payload", { url: config.settings.wishlistUrl });
     await page.goto(config.settings.wishlistUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
-    await page.waitForTimeout(2_000);
-    const wishlistResults = await verifySelectorPage(page, SELECTORS.wishlist as never);
-    logger.info("verify", "wishlist_selector_results", { results: wishlistResults });
+    const html = (await page.content().catch(() => "")) ?? "";
+    const state = parseWishlistStock(html);
+    const trackedMatches = config.items.map((it) => {
+      const id = extractProductId(it.url);
+      return {
+        name: it.name,
+        productId: id,
+        onWishlist: id !== null && state.knownIds.has(id),
+        outOfStock: id !== null && state.outOfStockIds.has(id),
+      };
+    });
+    logger.info("verify", "wishlist_payload_results", {
+      wishlistItemCount: state.knownIds.size,
+      outOfStockCount: state.outOfStockIds.size,
+      trackedMatches,
+    });
   } finally {
     await page.close();
   }
@@ -463,7 +478,6 @@ async function main(): Promise<void> {
       logger,
       controller.signal,
       survival,
-      config.settings.pollSettleMs,
       (c) => {
         const idx = productIds.indexOf(c.productId);
         if (idx >= 0) {

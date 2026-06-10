@@ -122,6 +122,86 @@ export function isRestockTransition(
 }
 
 // ---------------------------------------------------------------------------
+// Wishlist stock parsing (from Lazada's server-embedded JSON)
+// ---------------------------------------------------------------------------
+
+export interface WishlistStockState {
+  knownIds: Set<string>;       // every itemId present on the wishlist
+  outOfStockIds: Set<string>;  // the subset Lazada flags out of stock
+}
+
+/**
+ * Extracts the balanced JSON array that follows `"<key>":` in `text`, respecting
+ * strings/escapes so brackets inside values (e.g. "[Limit 10 per person]") don't
+ * confuse the scan. Returns the raw `[...]` substring, or null if not found.
+ */
+function extractJsonArray(text: string, key: string): string | null {
+  const marker = `"${key}":`;
+  const at = text.indexOf(marker);
+  if (at < 0) return null;
+
+  let i = at + marker.length;
+  while (i < text.length && text[i] !== "[") i++;
+  if (i >= text.length) return null;
+
+  const begin = i;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') {
+      inStr = true;
+    } else if (c === "[") {
+      depth++;
+    } else if (c === "]") {
+      depth--;
+      if (depth === 0) return text.slice(begin, i + 1);
+    }
+  }
+  return null;
+}
+
+/** Collects every `"itemId":<digits>` inside an extracted array fragment. */
+function itemIdsIn(arrayFragment: string | null): string[] {
+  if (!arrayFragment) return [];
+  return [...arrayFragment.matchAll(/"itemId":(\d+)/g)].map((m) => m[1]!);
+}
+
+/**
+ * Parses the wishlist page HTML into a stock-state view using Lazada's embedded
+ * JSON: `lightItemDetailDTO` lists every wishlist item, `outOfStock` lists the
+ * out-of-stock subset. Robust to UI/CSS changes since it reads the same data the
+ * page renders from. `knownIds` is empty when the JSON markers are absent (the
+ * caller treats that as "no data this poll").
+ */
+export function parseWishlistStock(html: string): WishlistStockState {
+  const allIds = itemIdsIn(extractJsonArray(html, "lightItemDetailDTO"));
+  const oosIds = itemIdsIn(extractJsonArray(html, "outOfStock"));
+  return {
+    knownIds: new Set([...allIds, ...oosIds]),
+    outOfStockIds: new Set(oosIds),
+  };
+}
+
+/**
+ * Classifies one item against a parsed wishlist state. Not present on the
+ * wishlist ⇒ "unknown" (never fires a buy); present and flagged ⇒ "out_of_stock";
+ * present and not flagged ⇒ "in_stock".
+ */
+export function classifyFromWishlistState(
+  productId: string,
+  state: WishlistStockState
+): StockStatus {
+  if (!state.knownIds.has(productId)) return "unknown";
+  return state.outOfStockIds.has(productId) ? "out_of_stock" : "in_stock";
+}
+
+// ---------------------------------------------------------------------------
 // Challenge-survival backoff
 // ---------------------------------------------------------------------------
 

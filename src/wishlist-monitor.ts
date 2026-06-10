@@ -2,30 +2,38 @@
  * Wishlist watcher.
  *
  * A single page polls the account wishlist and classifies every tracked item
- * (in_stock / out_of_stock / unknown) by inspecting its card. On an
- * out_of_stock → in_stock transition it fires that item's RestockGate, waking
- * the corresponding buyer. One watcher fans out to N buyers — far fewer requests
- * than one PDP poll per item, which is the main anti-bot win.
+ * (in_stock / out_of_stock / unknown). On an out_of_stock → in_stock transition
+ * it fires that item's RestockGate, waking the corresponding buyer. One watcher
+ * fans out to N buyers — far fewer requests than one PDP poll per item, which is
+ * the main anti-bot win.
+ *
+ * Stock state is read from the JSON Lazada embeds in the served wishlist HTML
+ * (`lightItemDetailDTO` = all items, `outOfStock` = the out-of-stock subset),
+ * parsed by the pure decision.parseWishlistStock. This is robust to UI/CSS
+ * changes and needs no render settle — the data is present at domcontentloaded,
+ * before the card grid hydrates.
  *
  * Mirrors monitor.ts: never throws on transient page errors, survives anti-bot
  * challenges by backing off and resuming (bounded by a circuit breaker), and
  * halts loudly on login_required (the watcher is a single point of failure for
  * all buyers, so a session expiry must surface, not be swallowed).
- *
- * All per-card matching goes through resolveSelectorWithin — no inline locators
- * in classification logic (CLAUDE.md selector invariant).
  */
 
-import { Page, Locator } from "playwright";
+import { Page } from "playwright";
 import { Item, StockStatus, ChallengeSurvivalOptions } from "./types";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
-import { SELECTORS, resolveSelectorWithin } from "./selectors";
 import { detectChallenge } from "./auth";
 import { navigateTo } from "./browser-actions";
-import { computeChallengeBackoff, extractProductId, isRestockTransition } from "./decision";
+import {
+  computeChallengeBackoff,
+  extractProductId,
+  isRestockTransition,
+  parseWishlistStock,
+  classifyFromWishlistState,
+} from "./decision";
 import { interruptibleSleep } from "./monitor";
-import { captureDomSnapshot } from "./diagnostics";
+import { captureNamedSnapshot } from "./diagnostics";
 import { RestockRegistry } from "./restock-signal";
 
 const MODULE = "wishlist";
@@ -35,7 +43,7 @@ const MATCH_MISS_WARN_THRESHOLD = 5;
 export interface WishlistClassification {
   productId: string;
   status: StockStatus; // in_stock | out_of_stock | unknown
-  matchedCard: boolean; // false ⇒ item not found on the wishlist this poll
+  matchedCard: boolean; // false ⇒ item not found in the wishlist data this poll
 }
 
 type WishlistResult =
@@ -54,7 +62,6 @@ export async function checkWishlist(
   wishlistUrl: string,
   rateLimiter: RateLimiter,
   logger: Logger,
-  settleMs: number,
   debugDir?: string
 ): Promise<WishlistResult> {
   await rateLimiter.acquire(LAZADA_DOMAIN);
@@ -65,8 +72,6 @@ export async function checkWishlist(
     logger.warn(MODULE, "navigation_failed", { error: (err as Error).message });
     return { kind: "error" };
   }
-
-  await waitForWishlistReady(page, settleMs);
 
   const challenge = await detectChallenge(page, logger);
   if (challenge) {
@@ -80,15 +85,27 @@ export async function checkWishlist(
   }
 
   if (debugDir) {
-    await captureDomSnapshot(
-      page,
-      { name: "wishlist", url: wishlistUrl, maxPrice: 0, quantity: 1 } as Item,
-      debugDir,
-      logger
-    );
+    await captureNamedSnapshot(page, "wishlist", debugDir, logger);
   }
 
-  const classifications = await classifyCards(page, trackedIds, logger);
+  const html = await page.content().catch(() => null);
+  if (!html) {
+    logger.warn(MODULE, "page_content_unreadable");
+    return { kind: "error" };
+  }
+
+  const state = parseWishlistStock(html);
+  if (state.knownIds.size === 0) {
+    // No embedded wishlist data — wrong page, empty wishlist, or Lazada changed
+    // the payload shape. Treat as no-data; every item classifies "unknown".
+    logger.warn(MODULE, "no_wishlist_data_in_page", { url: page.url() });
+  }
+
+  const classifications = trackedIds.map((id) => {
+    const status = classifyFromWishlistState(id, state);
+    return { productId: id, status, matchedCard: status !== "unknown" };
+  });
+
   return { kind: "ok", classifications };
 }
 
@@ -106,7 +123,6 @@ export async function watchWishlist(
   logger: Logger,
   signal: AbortSignal,
   survival: ChallengeSurvivalOptions,
-  settleMs: number,
   onClassified: (c: WishlistClassification) => void,
   debugDir?: string
 ): Promise<void> {
@@ -126,7 +142,7 @@ export async function watchWishlist(
   let consecutiveChallenges = 0;
 
   while (!signal.aborted) {
-    const result = await checkWishlist(page, trackedIds, wishlistUrl, rateLimiter, logger, settleMs, debugDir);
+    const result = await checkWishlist(page, trackedIds, wishlistUrl, rateLimiter, logger, debugDir);
 
     if (result.kind === "anti_bot") {
       if (!survival.surviveChallenges) {
@@ -175,7 +191,7 @@ export async function watchWishlist(
           logger.warn(MODULE, "item_not_found_on_wishlist", {
             productId: c.productId,
             consecutiveMisses: streak,
-            hint: "Is the item still on the wishlist? Does its URL id match a card link?",
+            hint: "Is the item still on the wishlist? Does its URL id match the wishlist itemId?",
           });
         }
         continue;
@@ -200,87 +216,4 @@ export async function watchWishlist(
   }
 
   logger.info(MODULE, "watch_aborted");
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/** Adaptive settle for the wishlist page — anchors on the card list. */
-async function waitForWishlistReady(page: Page, settleMs: number): Promise<void> {
-  if (settleMs <= 0) return;
-  const anchor = SELECTORS.wishlist.cardList.candidates.join(", ");
-  await page
-    .locator(anchor)
-    .first()
-    .waitFor({ state: "visible", timeout: settleMs })
-    .catch(() => {
-      /* nothing rendered within settleMs — classify whatever is there */
-    });
-}
-
-/**
- * Classifies every tracked item from the wishlist DOM. Items not present on the
- * wishlist are returned with matchedCard:false / status:"unknown".
- */
-async function classifyCards(
-  page: Page,
-  trackedIds: string[],
-  logger: Logger
-): Promise<WishlistClassification[]> {
-  const byId = new Map<string, WishlistClassification>();
-  for (const id of trackedIds) {
-    byId.set(id, { productId: id, status: "unknown", matchedCard: false });
-  }
-
-  const cards = await getCardLocators(page);
-
-  for (const card of cards) {
-    const href = await readCardHref(card);
-    if (!href) continue;
-    const id = extractProductId(href);
-    if (!id || !byId.has(id)) continue;
-
-    const status = await classifyCard(card);
-    byId.set(id, { productId: id, status, matchedCard: true });
-    logger.debug(MODULE, "card_classified", { productId: id, status });
-  }
-
-  return trackedIds.map((id) => byId.get(id)!);
-}
-
-/** Returns every wishlist card locator, using the first cardList candidate that matches. */
-async function getCardLocators(page: Page): Promise<Locator[]> {
-  for (const candidate of SELECTORS.wishlist.cardList.candidates) {
-    const locator = page.locator(candidate);
-    const count = await locator.count().catch(() => 0);
-    if (count > 0) {
-      return locator.all();
-    }
-  }
-  return [];
-}
-
-/** Reads the PDP link href from a card via the abstraction layer. */
-async function readCardHref(card: Locator): Promise<string | null> {
-  const resolved = await resolveSelectorWithin(card, SELECTORS.wishlist.cardProductLink, 1_000).catch(
-    () => null
-  );
-  if (!resolved) return null;
-  return card.locator(resolved.selector).first().getAttribute("href").catch(() => null);
-}
-
-/** OOS marker wins; else an enabled Add to Cart means in stock; else unknown. */
-async function classifyCard(card: Locator): Promise<StockStatus> {
-  const oos = await resolveSelectorWithin(card, SELECTORS.wishlist.cardOutOfStock, 1_000).catch(
-    () => null
-  );
-  if (oos) return "out_of_stock";
-
-  const addToCart = await resolveSelectorWithin(card, SELECTORS.wishlist.cardAddToCart, 1_000).catch(
-    () => null
-  );
-  if (addToCart) return "in_stock";
-
-  return "unknown";
 }

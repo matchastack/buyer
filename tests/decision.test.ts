@@ -6,6 +6,8 @@ import {
   computeChallengeBackoff,
   extractProductId,
   isRestockTransition,
+  parseWishlistStock,
+  classifyFromWishlistState,
   isAntiBot,
   formatOrderSummary,
 } from "../src/decision";
@@ -251,6 +253,55 @@ describe("isRestockTransition", () => {
   it("does not fire on non-in_stock next states", () => {
     expect(isRestockTransition("in_stock", "out_of_stock")).toBe(false);
     expect(isRestockTransition("out_of_stock", "unknown")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseWishlistStock / classifyFromWishlistState
+// ---------------------------------------------------------------------------
+
+describe("parseWishlistStock", () => {
+  // Mirrors Lazada's embedded shape: lightItemDetailDTO = all items,
+  // outOfStock = the OOS subset. Title contains brackets to exercise the
+  // string-aware array scanner ("[Limit 10 per person]").
+  const html = `
+    <script>window.data={"lightItemDetailDTO":[
+      {"itemId":13638671361,"itemTitle":"Deck Case 9426143","skuList":[{"skuId":1}]},
+      {"itemId":13718919969,"itemTitle":"Chaos Rising [Limit 10 per person]","skuList":[{"skuId":2}]}
+    ],"outOfStock":[
+      {"itemId":13718919969,"itemTitle":"Chaos Rising [Limit 10 per person]"}
+    ]}</script>`;
+
+  it("collects every item id into knownIds", () => {
+    const state = parseWishlistStock(html);
+    expect(state.knownIds.has("13638671361")).toBe(true);
+    expect(state.knownIds.has("13718919969")).toBe(true);
+    expect(state.knownIds.size).toBe(2);
+  });
+
+  it("collects only the out-of-stock subset into outOfStockIds", () => {
+    const state = parseWishlistStock(html);
+    expect(state.outOfStockIds.has("13718919969")).toBe(true);
+    expect(state.outOfStockIds.has("13638671361")).toBe(false);
+  });
+
+  it("is not confused by brackets inside string values", () => {
+    // If the scanner ignored strings it would stop at the "[" in the title and
+    // miss the second item.
+    expect(parseWishlistStock(html).knownIds.size).toBe(2);
+  });
+
+  it("returns empty sets when the payload markers are absent", () => {
+    const state = parseWishlistStock("<html><body>nothing here</body></html>");
+    expect(state.knownIds.size).toBe(0);
+    expect(state.outOfStockIds.size).toBe(0);
+  });
+
+  it("classifies items against the parsed state", () => {
+    const state = parseWishlistStock(html);
+    expect(classifyFromWishlistState("13638671361", state)).toBe("in_stock");
+    expect(classifyFromWishlistState("13718919969", state)).toBe("out_of_stock");
+    expect(classifyFromWishlistState("99999999999", state)).toBe("unknown");
   });
 });
 
