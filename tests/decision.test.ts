@@ -4,6 +4,8 @@ import {
   shouldProceed,
   computeBackoff,
   computeChallengeBackoff,
+  extractProductId,
+  isRestockTransition,
   isAntiBot,
   formatOrderSummary,
 } from "../src/decision";
@@ -189,6 +191,54 @@ describe("computeChallengeBackoff", () => {
     const result = computeChallengeBackoff(1, 30_000, 300_000, 6);
     expect(typeof result.reason).toBe("string");
     expect(result.reason.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractProductId
+// ---------------------------------------------------------------------------
+
+describe("extractProductId", () => {
+  it("extracts the id from a standard PDP url", () => {
+    expect(extractProductId("https://www.lazada.sg/products/foo-i12345678.html")).toBe("12345678");
+  });
+
+  it("ignores query strings and fragments", () => {
+    expect(
+      extractProductId("https://www.lazada.sg/products/foo-i987.html?spm=a2o42.x&from=wishlist")
+    ).toBe("987");
+  });
+
+  it("is case-insensitive on the -i marker", () => {
+    expect(extractProductId("https://www.lazada.sg/products/foo-I555.html")).toBe("555");
+  });
+
+  it("returns null when there is no id segment", () => {
+    expect(extractProductId("https://www.lazada.sg/shop/pokemon")).toBeNull();
+    expect(extractProductId("https://www.lazada.sg/products/foo.html")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isRestockTransition
+// ---------------------------------------------------------------------------
+
+describe("isRestockTransition", () => {
+  it("fires on out_of_stock → in_stock", () => {
+    expect(isRestockTransition("out_of_stock", "in_stock")).toBe(true);
+  });
+
+  it("fires on first-ever in_stock (prev undefined)", () => {
+    expect(isRestockTransition(undefined, "in_stock")).toBe(true);
+  });
+
+  it("does not fire when already in_stock", () => {
+    expect(isRestockTransition("in_stock", "in_stock")).toBe(false);
+  });
+
+  it("does not fire on non-in_stock next states", () => {
+    expect(isRestockTransition("in_stock", "out_of_stock")).toBe(false);
+    expect(isRestockTransition("out_of_stock", "unknown")).toBe(false);
   });
 });
 

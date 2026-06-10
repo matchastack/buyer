@@ -195,6 +195,47 @@ describe("loadConfig", () => {
     expect(() => loadConfig(file)).toThrow(/minPageLoadDelayMs/i);
   });
 
+  it("defaults monitorMode to per-item", () => {
+    const file = writeTmpConfig(VALID_CONFIG);
+    expect(loadConfig(file).settings.monitorMode).toBe("per-item");
+  });
+
+  it("throws on an invalid monitorMode", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, monitorMode: "both" } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/monitorMode/i);
+  });
+
+  it("throws when wishlistUrl is not https", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, wishlistUrl: "http://x" } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/wishlistUrl/i);
+  });
+
+  it("throws when buyRetryMaxMs is below buyRetryBaseMs", () => {
+    const bad = {
+      ...VALID_CONFIG,
+      settings: { ...VALID_CONFIG.settings, buyRetryBaseMs: 1000, buyRetryMaxMs: 500 },
+    };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/buyRetryMaxMs/i);
+  });
+
+  it("accepts wishlist mode when every item URL has a product id", () => {
+    const cfg = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, monitorMode: "wishlist" } };
+    const file = writeTmpConfig(cfg);
+    expect(loadConfig(file).settings.monitorMode).toBe("wishlist");
+  });
+
+  it("throws in wishlist mode when an item URL has no extractable product id", () => {
+    const bad = {
+      items: [{ url: "https://www.lazada.sg/shop/pokemon-store", name: "No Id", maxPrice: 10, quantity: 1 }],
+      settings: { dryRun: true, monitorMode: "wishlist" },
+    };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/product id/i);
+  });
+
   it("throws for unknown settings key", () => {
     const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, unknownKey: true } };
     const file = writeTmpConfig(bad);

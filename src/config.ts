@@ -9,6 +9,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { Config, Item, Settings } from "./types";
+import { extractProductId } from "./decision";
 
 // ---------------------------------------------------------------------------
 // Credential access (env-vars only)
@@ -93,6 +94,12 @@ const DEFAULTS: Settings = {
   challengeBackoffBaseMs: 30_000,  // First challenge backoff (grows exponentially)
   challengeBackoffMaxMs: 300_000,  // Cap challenge backoff at 5 minutes
   maxConsecutiveChallenges: 6,     // Give up after 6 challenges with no good check between
+  monitorMode: "per-item",         // Safe default — unchanged behaviour; opt into "wishlist"
+  wishlistUrl: "https://my.lazada.sg/wishlist/index",
+  wishlistPollIntervalMs: 2_000,   // One watcher poll regardless of item count
+  buyMaxRetries: 5,                // Fast OOS retries on the buy path (traffic vs sellout)
+  buyRetryBaseMs: 400,             // Sub-second backoff so retries fit the drop window
+  buyRetryMaxMs: 2_000,
 };
 
 // ---------------------------------------------------------------------------
@@ -220,6 +227,24 @@ function validateSettings(raw: Record<string, unknown>): Settings {
       "settings.maxConsecutiveChallenges must be an integer >= 1"
     );
   }
+  if (merged.monitorMode !== "wishlist" && merged.monitorMode !== "per-item") {
+    throw new ConfigValidationError('settings.monitorMode must be "wishlist" or "per-item"');
+  }
+  if (typeof merged.wishlistUrl !== "string" || !merged.wishlistUrl.startsWith("https://")) {
+    throw new ConfigValidationError("settings.wishlistUrl must be a string starting with https://");
+  }
+  if (merged.wishlistPollIntervalMs < 1_000) {
+    throw new ConfigValidationError("settings.wishlistPollIntervalMs must be >= 1000ms");
+  }
+  if (!Number.isInteger(merged.buyMaxRetries) || merged.buyMaxRetries < 1 || merged.buyMaxRetries > 10) {
+    throw new ConfigValidationError("settings.buyMaxRetries must be an integer between 1 and 10");
+  }
+  if (merged.buyRetryBaseMs < 100) {
+    throw new ConfigValidationError("settings.buyRetryBaseMs must be >= 100ms");
+  }
+  if (merged.buyRetryMaxMs < merged.buyRetryBaseMs) {
+    throw new ConfigValidationError("settings.buyRetryMaxMs must be >= buyRetryBaseMs");
+  }
 
   return merged;
 }
@@ -279,6 +304,20 @@ export function loadConfig(configPath?: string): Config {
       ? (obj["settings"] as Record<string, unknown>)
       : {}
   );
+
+  // In wishlist mode the watcher matches cards to items by product id extracted
+  // from the URL — an item whose URL has no id could never be matched (and would
+  // silently never buy), so fail fast.
+  if (settings.monitorMode === "wishlist") {
+    items.forEach((item, i) => {
+      if (extractProductId(item.url) === null) {
+        throw new ConfigValidationError(
+          `items[${i}].url has no extractable product id (expected "...-i<digits>.html"), ` +
+          "required for monitorMode \"wishlist\""
+        );
+      }
+    });
+  }
 
   return { items, settings };
 }

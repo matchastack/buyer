@@ -13,7 +13,7 @@
  */
 
 import { Page } from "playwright";
-import { Item, Config, CheckoutResult } from "./types";
+import { Item, Config, CheckoutResult, RetryProfile } from "./types";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
 import { SELECTORS, resolveSelector } from "./selectors";
@@ -34,7 +34,8 @@ export async function checkout(
   config: Config,
   rateLimiter: RateLimiter,
   logger: Logger,
-  alreadyOnProductPage = false
+  alreadyOnProductPage = false,
+  retry?: RetryProfile
 ): Promise<CheckoutResult> {
   // ── Dry-run guard — must be first ──────────────────────────────────────────
   if (config.settings.dryRun) {
@@ -42,9 +43,17 @@ export async function checkout(
     return { success: false, orderNumber: null, error: "dry-run mode" };
   }
 
+  // Default to the per-item retry profile so existing callers are unchanged;
+  // wishlist buyers pass a fast profile to keep retries inside the drop window.
+  const profile: RetryProfile = retry ?? {
+    maxRetries: config.settings.maxRetries,
+    baseMs: config.settings.retryBackoffBaseMs,
+    maxMs: config.settings.retryBackoffMaxMs,
+  };
+
   logger.info(MODULE, "checkout_start", { item: item.name, fastPath: alreadyOnProductPage });
 
-  for (let attempt = 1; attempt <= config.settings.maxRetries; attempt++) {
+  for (let attempt = 1; attempt <= profile.maxRetries; attempt++) {
     // Only the very first attempt can act on the live in-stock page. Any retry
     // means the previous attempt navigated away, so it must reload (and pace).
     const skipInitialNav = alreadyOnProductPage && attempt === 1;
@@ -52,10 +61,10 @@ export async function checkout(
 
     if (result.success) return result;
 
-    if (attempt < config.settings.maxRetries) {
+    if (attempt < profile.maxRetries) {
       const backoffMs = Math.min(
-        config.settings.retryBackoffBaseMs * Math.pow(2, attempt - 1),
-        config.settings.retryBackoffMaxMs
+        profile.baseMs * Math.pow(2, attempt - 1),
+        profile.maxMs
       );
       logger.warn(MODULE, "retry_backoff", { item: item.name, attempt, backoffMs });
       await sleep(backoffMs);
@@ -65,7 +74,7 @@ export async function checkout(
   return {
     success: false,
     orderNumber: null,
-    error: `Failed after ${config.settings.maxRetries} attempt(s)`,
+    error: `Failed after ${profile.maxRetries} attempt(s)`,
   };
 }
 

@@ -92,6 +92,32 @@ export function isAntiBot(status: StockStatus): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Product-id extraction & restock transition (wishlist mode)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts the Lazada product id from a PDP or wishlist link.
+ * e.g. "https://www.lazada.sg/products/foo-i12345678.html?x=1" → "12345678".
+ * Returns null when no id segment is present.
+ */
+export function extractProductId(url: string): string | null {
+  const match = url.match(/-i(\d+)\.html/i);
+  return match ? match[1]! : null;
+}
+
+/**
+ * Pure edge-trigger rule: did this item just become buyable?
+ * True only on a transition into in_stock from any other (or unseen) state, so
+ * a still-in-stock item is not re-fired on every wishlist poll.
+ */
+export function isRestockTransition(
+  prev: StockStatus | undefined,
+  next: StockStatus
+): boolean {
+  return next === "in_stock" && prev !== "in_stock";
+}
+
+// ---------------------------------------------------------------------------
 // Challenge-survival backoff
 // ---------------------------------------------------------------------------
 

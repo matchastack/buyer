@@ -296,7 +296,7 @@ async function determineStatus(
   return "unknown";
 }
 
-async function interruptibleSleep(ms: number, signal: AbortSignal): Promise<void> {
+export async function interruptibleSleep(ms: number, signal: AbortSignal): Promise<void> {
   const step = 500;
   let elapsed = 0;
   while (elapsed < ms && !signal.aborted) {

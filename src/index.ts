@@ -11,18 +11,21 @@
  */
 
 import * as path from "path";
-import { chromium, BrowserContext } from "playwright";
+import { chromium, BrowserContext, Page } from "playwright";
 import * as dotenv from "dotenv";
 import { loadConfig, loadCredentials, loadTelegramCredentials } from "./config";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
 import { loadSession, login, saveSession, isLoggedIn, ChallengeDetectedError } from "./auth";
 import { waitForStock } from "./monitor";
-import { shouldProceed, isAntiBot } from "./decision";
+import { watchWishlist } from "./wishlist-monitor";
+import { RestockRegistry, RestockGate } from "./restock-signal";
+import { shouldProceed, isAntiBot, extractProductId } from "./decision";
 import { checkout } from "./checkout";
+import { navigateTo } from "./browser-actions";
 import { startHealthServer, RuntimeStatus, ItemStatus } from "./health";
 import { applyStealth } from "./stealth";
-import { Item, Config, StockCheckResult, ChallengeSurvivalOptions } from "./types";
+import { Item, Config, StockCheckResult, ChallengeSurvivalOptions, RetryProfile } from "./types";
 
 // ---------------------------------------------------------------------------
 // CLI flags
@@ -137,6 +140,71 @@ async function runItemWorker(
 }
 
 // ---------------------------------------------------------------------------
+// Per-item buyer (wishlist mode)
+// ---------------------------------------------------------------------------
+
+/**
+ * Idles on its RestockGate until the wishlist watcher signals this item is back
+ * in stock, then reloads its (warm) product page and runs checkout with a fast
+ * retry profile so transient out-of-stock (traffic) is retried within the drop
+ * window. Loops back to wait for the next restock after a failed attempt.
+ */
+async function runBuyerWorker(
+  item: Item,
+  productId: string,
+  page: Page,
+  config: Config,
+  rateLimiter: RateLimiter,
+  logger: Logger,
+  gate: RestockGate,
+  signal: AbortSignal,
+  itemStatus: ItemStatus,
+  runtimeStatus: RuntimeStatus
+): Promise<void> {
+  const fastRetry: RetryProfile = {
+    maxRetries: config.settings.buyMaxRetries,
+    baseMs: config.settings.buyRetryBaseMs,
+    maxMs: config.settings.buyRetryMaxMs,
+  };
+
+  while (!signal.aborted) {
+    await gate.waitForRestock(signal);
+    if (signal.aborted) return;
+
+    logger.info("buyer", "restock_signal_received", { item: item.name, productId });
+    itemStatus.lastChecked = new Date().toISOString();
+    runtimeStatus.totalCheckoutAttempts++;
+
+    try {
+      // Warm reload: a page held open for hours won't auto-enable Buy Now, but
+      // the reload skips the rate limiter and reuses the warm session. The first
+      // checkout attempt then acts on this just-loaded page (alreadyOnProductPage).
+      await navigateTo(page, item.url, logger);
+
+      const checkoutResult = await checkout(page, item, config, rateLimiter, logger, true, fastRetry);
+
+      if (checkoutResult.success) {
+        runtimeStatus.totalPurchases++;
+        logger.info("buyer", "purchase_complete", {
+          item: item.name,
+          orderNumber: checkoutResult.orderNumber,
+        });
+        return;
+      }
+
+      // Likely a genuine sellout this drop — idle until the next restock.
+      logger.warn("buyer", "purchase_incomplete", { item: item.name, error: checkoutResult.error });
+    } catch (err) {
+      if (err instanceof ChallengeDetectedError) {
+        logger.error("buyer", "anti_bot_during_buy", { item: item.name });
+        throw err; // fail-closed on the buy path
+      }
+      logger.error("buyer", "buy_error", { item: item.name, error: (err as Error).message });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Selector verification mode
 // ---------------------------------------------------------------------------
 
@@ -165,6 +233,12 @@ async function verifySelectors(
       const productResults = await verifySelectorPage(page, SELECTORS.product as never);
       logger.info("verify", "product_selector_results", { results: productResults });
     }
+
+    logger.info("verify", "checking_wishlist_page_selectors", { url: config.settings.wishlistUrl });
+    await page.goto(config.settings.wishlistUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
+    await page.waitForTimeout(2_000);
+    const wishlistResults = await verifySelectorPage(page, SELECTORS.wishlist as never);
+    logger.info("verify", "wishlist_selector_results", { results: wishlistResults });
   } finally {
     await page.close();
   }
@@ -321,23 +395,91 @@ async function main(): Promise<void> {
     logger.info("main", "debug_snapshots_enabled", { debugDir });
   }
 
-  logger.info("main", "workers_starting", { items: config.items.map((i) => i.name) });
+  logger.info("main", "workers_starting", {
+    mode: config.settings.monitorMode,
+    items: config.items.map((i) => i.name),
+  });
 
-  const workers = config.items.map((item, index) =>
-    runItemWorker(
-      item,
-      config,
-      context,
+  let results: PromiseSettledResult<void>[];
+
+  if (config.settings.monitorMode === "wishlist") {
+    // One watcher polls the wishlist and fans out restock signals to N buyers,
+    // each idling on a pre-opened warm product page.
+    const survival: ChallengeSurvivalOptions = {
+      surviveChallenges: config.settings.surviveChallenges,
+      challengeBackoffBaseMs: config.settings.challengeBackoffBaseMs,
+      challengeBackoffMaxMs: config.settings.challengeBackoffMaxMs,
+      maxConsecutiveChallenges: config.settings.maxConsecutiveChallenges,
+    };
+
+    const registry = new RestockRegistry();
+    // Non-null: loadConfig guarantees every URL yields an id in wishlist mode.
+    const productIds = config.items.map((it) => extractProductId(it.url)!);
+    const gates = productIds.map((id) => registry.register(id));
+    const buyerPages = await Promise.all(config.items.map(() => context.newPage()));
+    const watcherPage = await context.newPage();
+
+    const watcher = watchWishlist(
+      watcherPage,
+      config.items,
+      registry,
+      config.settings.wishlistUrl,
+      config.settings.wishlistPollIntervalMs,
       rateLimiter,
       logger,
       controller.signal,
-      itemStatuses[index]!,
-      runtimeStatus,
+      survival,
+      config.settings.pollSettleMs,
+      (c) => {
+        const idx = productIds.indexOf(c.productId);
+        if (idx >= 0) {
+          const s = itemStatuses[idx]!;
+          s.lastChecked = new Date().toISOString();
+          s.lastStatus = c.status;
+          s.checkCount++;
+        }
+      },
       debugDir
-    )
-  );
+    ).finally(() => {
+      // Watcher death (login_required / circuit breaker) blinds all buyers, so
+      // halt the run: abort wakes idle buyers, which then exit.
+      controller.abort();
+      registry.abortAll();
+    });
 
-  const results = await Promise.allSettled(workers);
+    const buyers = config.items.map((item, i) =>
+      runBuyerWorker(
+        item,
+        productIds[i]!,
+        buyerPages[i]!,
+        config,
+        rateLimiter,
+        logger,
+        gates[i]!,
+        controller.signal,
+        itemStatuses[i]!,
+        runtimeStatus
+      )
+    );
+
+    results = await Promise.allSettled([watcher, ...buyers]);
+  } else {
+    const workers = config.items.map((item, index) =>
+      runItemWorker(
+        item,
+        config,
+        context,
+        rateLimiter,
+        logger,
+        controller.signal,
+        itemStatuses[index]!,
+        runtimeStatus,
+        debugDir
+      )
+    );
+
+    results = await Promise.allSettled(workers);
+  }
 
   const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
   if (failed.length > 0) {
