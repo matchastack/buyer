@@ -68,6 +68,31 @@ export const SELECTORS = {
       ],
       required: true,
     } satisfies SelectorSet,
+
+    loginLink: {
+      description: "Login link/button in the site header — visible = logged OUT",
+      candidates: [
+        'a[href*="/customer/account/login"]',
+        'a[href*="member/login"]',
+        'a[href*="/login"]',
+        'a:has-text("Login")',
+        'a:has-text("Log In")',
+      ],
+      required: false,
+    } satisfies SelectorSet,
+
+    loggedInIndicator: {
+      description: "Account/avatar affordance in the header — visible = logged IN (positive signal)",
+      candidates: [
+        '[class*="lzd-site-nav-user"]',
+        '[class*="site-nav-user"]',
+        '[class*="username"]',
+        'a[href*="/customer/account"]:not([href*="login"])',
+        '[class*="account-menu"]',
+        'a:has-text("My Account")',
+      ],
+      required: false,
+    } satisfies SelectorSet,
   },
 
   // ---- Anti-bot / challenge indicators ------------------------------------

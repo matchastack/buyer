@@ -20,6 +20,32 @@ function sanitizeName(name: string): string {
 }
 
 /**
+ * Saves a full-page screenshot (.png) and full HTML (.html) to `dir`, prefixed
+ * with `name`. Errors are swallowed — diagnostics must never crash the process.
+ */
+export async function captureNamedSnapshot(
+  page: Page,
+  name: string,
+  dir: string,
+  logger: Logger
+): Promise<void> {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const base = path.join(dir, `${sanitizeName(name)}-${ts}`);
+
+    await page.screenshot({ path: `${base}.png`, fullPage: true }).catch(() => {});
+
+    const html = await page.content().catch(() => null);
+    if (html) fs.writeFileSync(`${base}.html`, html, "utf-8");
+
+    logger.info(MODULE, "snapshot_saved", { name, base });
+  } catch (err) {
+    logger.warn(MODULE, "snapshot_failed", { name, error: (err as Error).message });
+  }
+}
+
+/**
  * Saves a full-page screenshot (.png) and full HTML (.html) to debugDir.
  * Errors are swallowed — diagnostics must never crash the main process.
  */
@@ -29,23 +55,7 @@ export async function captureDomSnapshot(
   debugDir: string,
   logger: Logger
 ): Promise<void> {
-  try {
-    fs.mkdirSync(debugDir, { recursive: true });
-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    const base = path.join(debugDir, `${sanitizeName(item.name)}-${ts}`);
-
-    await page.screenshot({ path: `${base}.png`, fullPage: true }).catch(() => {});
-
-    const html = await page.content().catch(() => null);
-    if (html) fs.writeFileSync(`${base}.html`, html, "utf-8");
-
-    logger.info(MODULE, "dom_snapshot_saved", { item: item.name, base });
-  } catch (err) {
-    logger.warn(MODULE, "dom_snapshot_failed", {
-      item: item.name,
-      error: (err as Error).message,
-    });
-  }
+  await captureNamedSnapshot(page, item.name, debugDir, logger);
 }
 
 /**

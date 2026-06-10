@@ -16,7 +16,7 @@ import * as dotenv from "dotenv";
 import { loadConfig, loadCredentials, loadTelegramCredentials } from "./config";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
-import { loadSession, login, saveSession, isLoggedIn, ChallengeDetectedError } from "./auth";
+import { loadSession, login, saveSession, isLoggedIn, runAuthDebug, ChallengeDetectedError } from "./auth";
 import { waitForStock } from "./monitor";
 import { watchWishlist } from "./wishlist-monitor";
 import { RestockRegistry, RestockGate } from "./restock-signal";
@@ -35,6 +35,8 @@ const args = process.argv.slice(2);
 const CLI_DRY_RUN = args.includes("--dry-run");
 const CLI_VERIFY_SELECTORS = args.includes("--verify-selectors");
 const CLI_DEBUG_DOM = args.includes("--debug-dom");
+const CLI_AUTH_DEBUG = args.includes("--auth-debug");
+const AUTH_DEBUG_PAUSE_MS = 2_000;
 
 // ---------------------------------------------------------------------------
 // Per-item worker
@@ -264,6 +266,10 @@ async function main(): Promise<void> {
   if (CLI_DEBUG_DOM) {
     config.settings.debugSnapshots = true;
   }
+  // Auth-debug must be observable — force a visible browser.
+  if (CLI_AUTH_DEBUG) {
+    config.settings.headless = false;
+  }
 
   const logger = new Logger(config.settings.logDir);
 
@@ -322,6 +328,33 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+  // ── Auth debug mode ──────────────────────────────────────────────────────
+  // Observable, headed login: clears cookies, steps through fill email → fill
+  // password → submit → homepage, snapshotting each step to data/debug/auth/.
+
+  if (CLI_AUTH_DEBUG) {
+    const snapshotDir = path.join(config.settings.dataDir, "debug", "auth");
+    logger.info("main", "auth_debug_mode", { snapshotDir, pauseMs: AUTH_DEBUG_PAUSE_MS });
+    const authPage = await context.newPage();
+    try {
+      const loggedIn = await runAuthDebug(
+        context,
+        authPage,
+        logger,
+        config.settings.sessionFile,
+        snapshotDir,
+        AUTH_DEBUG_PAUSE_MS
+      );
+      logger.info("main", "auth_debug_result", { loggedIn });
+      await shutdown("auth_debug_complete");
+      process.exit(loggedIn ? 0 : 1);
+    } catch (err) {
+      logger.error("main", "auth_debug_failed", { error: (err as Error).message });
+      await shutdown("auth_debug_failed");
+      process.exit(1);
+    }
+  }
 
   // ── Authentication ───────────────────────────────────────────────────────
 
