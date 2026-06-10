@@ -39,7 +39,7 @@ The whole design is shaped by four invariants. None of them are optional:
 ```bash
 # 1. Install
 npm ci
-npx playwright install --with-deps chromium
+npx playwright install --with-deps chromium   # version tied to playwright 1.56.1 in package.json
 
 # 2. Configure
 cp .env.example .env           # fill in LAZADA_EMAIL, LAZADA_PASSWORD
@@ -47,13 +47,13 @@ cp config.example.json config.json
 #   → edit items[] with the product URLs you care about
 #   → keep "dryRun": true for first run
 
-# 3. First run in dry-run mode (also seeds session.json after login)
+# 3. First run in dry-run mode (also seeds the session file after login)
 npm run dev:dry-run
 ```
 
 The first run opens a visible browser so you can complete login (and solve a
-CAPTCHA if Lazada shows one). On success, `session.json` is saved and reused
-on subsequent runs.
+CAPTCHA if Lazada shows one). On success, `data/session.json` is saved and
+reused on subsequent runs.
 
 ---
 
@@ -81,8 +81,7 @@ Edit `config.json`:
     "retryBackoffBaseMs": 2000,
     "retryBackoffMaxMs": 30000,
     "paymentMethod": "paynow",
-    "sessionFile": "session.json",
-    "logDir": "logs"
+    "dataDir": "data"
   }
 }
 ```
@@ -113,6 +112,31 @@ Settings of note:
 
 ---
 
+## Testing
+
+```bash
+npm test                  # One-shot run (70 tests)
+npm run test:watch        # Re-runs on file changes
+npm run test:coverage     # Coverage report
+
+# Run a single file or filter by name:
+npx vitest run tests/decision.test.ts
+npx vitest run -t "returns proceed=false in dry-run mode"
+```
+
+Unit tests cover **pure logic only** — modules with no I/O or Playwright dependency:
+
+| File | What it covers |
+| --- | --- |
+| `tests/decision.test.ts` | `isPriceAcceptable`, `shouldProceed`, `computeBackoff`, `isAntiBot`, `formatOrderSummary` (including null price/total fallbacks) |
+| `tests/config.test.ts` | `loadCredentials`, `loadConfig` — validation, key rejection, defaults |
+| `tests/rate-limiter.test.ts` | Per-domain rate limiting, jitter, reset, `getLastUsed` |
+| `tests/payment-approval.test.ts` | Telegram message building, callback parsing, polling loop, dispatcher routing |
+
+Modules that require a live browser (`auth`, `monitor`, `checkout`, `browser-actions`) are tested manually via `npm run verify-selectors` and `npm run dev:dry-run`.
+
+---
+
 ## Architecture
 
 ```
@@ -139,7 +163,8 @@ risky logic is trivially testable.
 
 ## Logs
 
-Every run appends to `logs/audit-YYYY-MM-DD.log`, one JSON object per line.
+Every run appends to `data/logs/audit-YYYY-MM-DD.log`, one JSON object per line.
+The directory is set by `settings.dataDir` (default `"data"`) and can be overridden per-path via `settings.logDir`.
 Look for these `action` fields when reviewing a run:
 
 - `dry_run_skip` — purchase aborted because dry-run was on

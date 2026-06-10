@@ -10,16 +10,17 @@
  * Promise.allSettled is used so a failure on one item does not abort others.
  */
 
-import { chromium, BrowserContext } from "playwright";
 import * as path from "path";
-import * as fs from "fs";
+import { chromium, BrowserContext } from "playwright";
+import * as dotenv from "dotenv";
 import { loadConfig, loadCredentials, loadTelegramCredentials } from "./config";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
 import { loadSession, login, saveSession, isLoggedIn, ChallengeDetectedError } from "./auth";
 import { waitForStock } from "./monitor";
-import { shouldProceed, isAntiBot, computeBackoff, formatOrderSummary } from "./decision";
+import { shouldProceed, isAntiBot } from "./decision";
 import { checkout } from "./checkout";
+import { startHealthServer, RuntimeStatus, ItemStatus } from "./health";
 import { Item, Config, StockCheckResult } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,7 @@ import { Item, Config, StockCheckResult } from "./types";
 const args = process.argv.slice(2);
 const CLI_DRY_RUN = args.includes("--dry-run");
 const CLI_VERIFY_SELECTORS = args.includes("--verify-selectors");
+const CLI_DEBUG_DOM = args.includes("--debug-dom");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -53,7 +55,10 @@ async function runItemWorker(
   context: BrowserContext,
   rateLimiter: RateLimiter,
   logger: Logger,
-  signal: AbortSignal
+  signal: AbortSignal,
+  itemStatus: ItemStatus,
+  runtimeStatus: RuntimeStatus,
+  debugDir?: string
 ): Promise<void> {
   const page = await context.newPage();
 
@@ -65,8 +70,19 @@ async function runItemWorker(
       config.settings.checkIntervalMs,
       rateLimiter,
       logger,
-      signal
+      signal,
+      config.settings.debugSnapshots,
+      debugDir
     );
+
+    // Update item health metrics after each stock check
+    itemStatus.lastChecked = result.timestamp;
+    itemStatus.lastStatus = result.status;
+    itemStatus.checkCount++;
+    if (result.status === "anti_bot") {
+      itemStatus.antiBotCount++;
+      runtimeStatus.totalChallengesDetected++;
+    }
 
     if (signal.aborted) {
       logger.info("worker", "aborted_before_decision", { item: item.name });
@@ -94,9 +110,11 @@ async function runItemWorker(
     // Checkout
     logger.info("worker", "starting_checkout", { item: item.name, price: result.price });
 
+    runtimeStatus.totalCheckoutAttempts++;
     const checkoutResult = await checkout(page, item, config, rateLimiter, logger);
 
     if (checkoutResult.success) {
+      runtimeStatus.totalPurchases++;
       logger.info("worker", "purchase_complete", {
         item: item.name,
         orderNumber: checkoutResult.orderNumber,
@@ -153,30 +171,18 @@ async function verifySelectors(
 async function main(): Promise<void> {
   // ── Config & credentials ─────────────────────────────────────────────────
 
-  // Load .env if present (before config validation so env vars are available)
-  const envPath = path.join(process.cwd(), ".env");
-  if (fs.existsSync(envPath)) {
-    const envContent = fs.readFileSync(envPath, "utf-8");
-    for (const line of envContent.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith("#")) {
-        const eqIdx = trimmed.indexOf("=");
-        if (eqIdx > 0) {
-          const key = trimmed.slice(0, eqIdx).trim();
-          const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-          if (!process.env[key]) {
-            process.env[key] = val;
-          }
-        }
-      }
-    }
-  }
+  // Load .env if present (dotenv skips vars already set in environment)
+  dotenv.config();
 
   const config = loadConfig();
 
   // Override dryRun from CLI flag
   if (CLI_DRY_RUN) {
     config.settings.dryRun = true;
+  }
+  // Override debugSnapshots from CLI flag
+  if (CLI_DEBUG_DOM) {
+    config.settings.debugSnapshots = true;
   }
 
   const logger = new Logger(config.settings.logDir);
@@ -186,6 +192,7 @@ async function main(): Promise<void> {
     dryRun: config.settings.dryRun,
     headless: config.settings.headless,
     checkIntervalMs: config.settings.checkIntervalMs,
+    debugSnapshots: config.settings.debugSnapshots,
   });
 
   if (config.settings.dryRun) {
@@ -269,7 +276,39 @@ async function main(): Promise<void> {
     maxJitterMs: config.settings.maxPageLoadDelayMs - config.settings.minPageLoadDelayMs,
   });
 
+  // ── Runtime status (for health endpoint) ─────────────────────────────────
+
+  const itemStatuses: ItemStatus[] = config.items.map((item) => ({
+    name: item.name,
+    lastChecked: null,
+    lastStatus: null,
+    checkCount: 0,
+    antiBotCount: 0,
+  }));
+
+  const runtimeStatus: RuntimeStatus = {
+    startedAt: new Date().toISOString(),
+    dryRun: config.settings.dryRun,
+    items: itemStatuses,
+    totalChallengesDetected: 0,
+    totalCheckoutAttempts: 0,
+    totalPurchases: 0,
+  };
+
+  if (config.settings.healthPort > 0) {
+    startHealthServer(config.settings.healthPort, () => runtimeStatus);
+    logger.info("main", "health_server_started", { port: config.settings.healthPort });
+  }
+
   // ── Item workers ─────────────────────────────────────────────────────────
+
+  const debugDir = config.settings.debugSnapshots
+    ? path.join(config.settings.dataDir, "debug")
+    : undefined;
+
+  if (debugDir) {
+    logger.info("main", "debug_snapshots_enabled", { debugDir });
+  }
 
   logger.info("main", "workers_starting", {
     items: config.items.map((i) => i.name),
@@ -283,7 +322,17 @@ async function main(): Promise<void> {
         logger.info("main", "worker_startup_stagger", { item: item.name, delayMs: staggerMs });
         await startupDelay(staggerMs, controller.signal);
       }
-      await runItemWorker(item, config, context, rateLimiter, logger, controller.signal);
+      await runItemWorker(
+        item,
+        config,
+        context,
+        rateLimiter,
+        logger,
+        controller.signal,
+        itemStatuses[index]!,
+        runtimeStatus,
+        debugDir
+      );
     })()
   );
 

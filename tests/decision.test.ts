@@ -35,7 +35,7 @@ const orderSummary: OrderSummary = {
   quantity: 2,
   estimatedTotal: 79.8,
   deliveryAddress: "123 Orchard Road, Singapore 238858",
-  paymentMethod: "Visa ending 1234",
+  paymentMethod: "PayNow",
 };
 
 // ---------------------------------------------------------------------------
@@ -198,5 +198,27 @@ describe("formatOrderSummary", () => {
   it("returns a multi-line string", () => {
     const output = formatOrderSummary(orderSummary);
     expect(output.split("\n").length).toBeGreaterThan(5);
+  });
+
+  it("shows fallback text when price is null", () => {
+    const output = formatOrderSummary({ ...orderSummary, price: null });
+    expect(output).toContain("price not detected");
+    const priceLine = output.split("\n").find((l) => l.includes("Unit Price"));
+    expect(priceLine).not.toContain("S$");
+  });
+
+  it("shows fallback text when estimatedTotal is null", () => {
+    const output = formatOrderSummary({ ...orderSummary, estimatedTotal: null });
+    expect(output).toContain("total not detected");
+  });
+
+  it("formats price with two decimal places when present", () => {
+    const output = formatOrderSummary({ ...orderSummary, price: 39.9 });
+    expect(output).toContain("S$39.90");
+  });
+
+  it("formats estimatedTotal with two decimal places when present", () => {
+    const output = formatOrderSummary({ ...orderSummary, estimatedTotal: 79.8 });
+    expect(output).toContain("S$79.80");
   });
 });

@@ -19,7 +19,7 @@ const summary: OrderSummary = {
   quantity: 2,
   estimatedTotal: 79.8,
   deliveryAddress: "123 Orchard Road, Singapore 238858",
-  paymentMethod: "Visa ending 1234",
+  paymentMethod: "PayNow",
 };
 
 const baseSettings: Settings = {
@@ -30,7 +30,7 @@ const baseSettings: Settings = {
   maxRetries: 3,
   retryBackoffBaseMs: 2_000,
   retryBackoffMaxMs: 30_000,
-  paymentMethod: "credit_card",
+  paymentMethod: "paynow",
   sessionFile: "session.json",
   dryRun: false,
   logDir: "logs",

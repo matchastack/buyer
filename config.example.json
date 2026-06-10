@@ -23,9 +23,11 @@
     "retryBackoffBaseMs": 2000,
     "retryBackoffMaxMs": 30000,
     "paymentMethod": "paynow",
-    "sessionFile": "session.json",
+    "healthPort": 0,
+    "dataDir": "data",
     "logDir": "logs",
     "approvalMethod": "stdin",
+    "debugSnapshots": false,
     "workerStartDelayMs": 5000
   }
 }

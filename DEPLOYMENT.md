@@ -62,7 +62,7 @@ sudo adduser --disabled-password --gecos "" buyer
 sudo -iu buyer
 git clone <repo-url> ~/buyer && cd ~/buyer
 npm ci
-npx playwright install --with-deps chromium   # installs Chromium + system libs
+npx playwright install --with-deps chromium   # version tied to playwright 1.56.1 in package.json
 
 # 4. Configure
 cp .env.example .env && nano .env             # Lazada creds + Telegram bot/chat id
@@ -86,8 +86,8 @@ browser solve / show the challenge, then copy the resulting session file up:
 
 ```bash
 # On your laptop, after a successful login:
-scp session.json buyer@<droplet>:~/buyer/session.json
-ssh buyer@<droplet> chmod 600 ~/buyer/session.json
+scp data/session.json buyer@<droplet>:~/buyer/data/session.json
+ssh buyer@<droplet> chmod 600 ~/buyer/data/session.json
 ```
 
 After that the droplet can run fully headless.
@@ -126,7 +126,7 @@ sudo systemctl status buyer
 journalctl -u buyer -f       # tail live logs
 ```
 
-The app already rotates its own audit log daily (`logs/audit-YYYY-MM-DD.log`),
+The app already rotates its own audit log daily (`data/logs/audit-YYYY-MM-DD.log`),
 so no extra logrotate config is required.
 
 ### Monthly cost
@@ -163,7 +163,7 @@ CMD ["node", "dist/index.js"]
 docker run -d --name buyer --restart unless-stopped \
   -v $PWD/config.json:/app/config.json:ro \
   -v $PWD/.env:/app/.env:ro \
-  -v $PWD/session.json:/app/session.json \
+  -v $PWD/data:/app/data \
   -v $PWD/logs:/app/logs \
   buyer:latest
 ```
@@ -204,8 +204,8 @@ The codebase already enforces several invariants — don't undo them when you
 deploy:
 
 - `chmod 600 .env` on the host; never commit it.
-- `session.json` is written with mode `0600` by `src/auth.ts` — keep it that
-  way; treat it like a password.
+- `data/session.json` is written with mode `0600` by `src/auth.ts` — keep it
+  that way; treat it like a password.
 - Have PayNow linked to your Lazada account before going live — the bot
   selects it automatically and the QR will only appear if the payment method
   is correctly configured on the Lazada side.
