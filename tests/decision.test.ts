@@ -213,6 +213,18 @@ describe("extractProductId", () => {
     expect(extractProductId("https://www.lazada.sg/products/foo-I555.html")).toBe("555");
   });
 
+  it("extracts the id from the id-first + SKU url shape", () => {
+    expect(extractProductId("https://www.lazada.sg/products/i13696744288-s124594658123.html")).toBe(
+      "13696744288"
+    );
+  });
+
+  it("handles the id-first shape with a trailing query string", () => {
+    expect(extractProductId("https://www.lazada.sg/products/i13696744288-s124594658123.html?")).toBe(
+      "13696744288"
+    );
+  });
+
   it("returns null when there is no id segment", () => {
     expect(extractProductId("https://www.lazada.sg/shop/pokemon")).toBeNull();
     expect(extractProductId("https://www.lazada.sg/products/foo.html")).toBeNull();

@@ -96,12 +96,16 @@ export function isAntiBot(status: StockStatus): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Extracts the Lazada product id from a PDP or wishlist link.
- * e.g. "https://www.lazada.sg/products/foo-i12345678.html?x=1" → "12345678".
- * Returns null when no id segment is present.
+ * Extracts the Lazada product id from a PDP or wishlist link. Handles both URL
+ * shapes Lazada uses:
+ *   - id at the end of the slug:   ".../foo-i12345678.html"         → "12345678"
+ *   - id-first with a SKU suffix:  ".../i13696744288-s9988.html"    → "13696744288"
+ * The id is always the digits after the `i` marker (preceded by `/` or `-`),
+ * optionally followed by a `-s<sku>` segment, then `.html`. Returns null when no
+ * id segment is present.
  */
 export function extractProductId(url: string): string | null {
-  const match = url.match(/-i(\d+)\.html/i);
+  const match = url.match(/[/-]i(\d+)(?:-s\d+)?\.html/i);
   return match ? match[1]! : null;
 }
 
