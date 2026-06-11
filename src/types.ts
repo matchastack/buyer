@@ -34,6 +34,12 @@ export interface Item {
   quantity: number;  // Units to purchase (1–10)
 }
 
+export interface ProxySettings {
+  server: string;   // Proxy gateway as "host:port" (e.g. "gate.decodo.com:7000").
+                    // Credentials come from PROXY_USERNAME / PROXY_PASSWORD env vars.
+  bypass?: string;  // Optional comma-separated hosts that skip the proxy
+}
+
 export interface Settings {
   checkIntervalMs: number;       // Base poll interval per item (ms)
   minPageLoadDelayMs: number;    // Minimum delay between page loads (rate limiting)
@@ -51,6 +57,8 @@ export interface Settings {
   healthPort: number;             // 0 = disabled; 1024–65535 = bind health HTTP server on 127.0.0.1
   debugSnapshots: boolean;        // true = write DOM snapshots + selector report to <dataDir>/debug on each check
   workerStartDelayMs: number;     // Extra delay multiplied by worker index before first navigation (ms)
+  blockHeavyAssets: boolean;      // true = abort image/media/font requests (cuts proxy bandwidth + speeds polls)
+  proxy?: ProxySettings;          // Optional residential proxy; creds via PROXY_USERNAME/PROXY_PASSWORD env vars
 }
 
 export interface Config {

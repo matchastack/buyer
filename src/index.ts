@@ -13,7 +13,7 @@
 import * as path from "path";
 import { chromium, BrowserContext } from "playwright";
 import * as dotenv from "dotenv";
-import { loadConfig, loadCredentials, loadTelegramCredentials } from "./config";
+import { loadConfig, loadCredentials, loadTelegramCredentials, loadProxyCredentials } from "./config";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
 import { loadSession, login, saveSession, isLoggedIn, ChallengeDetectedError } from "./auth";
@@ -210,6 +210,10 @@ async function main(): Promise<void> {
 
   // ── Browser setup ────────────────────────────────────────────────────────
 
+  // Optional residential proxy. Returns null when unconfigured (run proxy-less);
+  // throws if only partially set so we never silently leak the real IP.
+  const proxyCreds = loadProxyCredentials(config.settings.proxy?.server);
+
   const browser = await chromium.launch({
     headless: config.settings.headless,
     args: [
@@ -219,12 +223,76 @@ async function main(): Promise<void> {
   });
 
   const context: BrowserContext = await browser.newContext({
+    ...(proxyCreds
+      ? {
+          proxy: {
+            server: proxyCreds.server,
+            username: proxyCreds.username,
+            password: proxyCreds.password,
+            ...(config.settings.proxy?.bypass ? { bypass: config.settings.proxy.bypass } : {}),
+          },
+        }
+      : {}),
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     viewport: { width: 1280, height: 800 },
     locale: "en-SG",
     timezoneId: "Asia/Singapore",
+    // Client hints + Accept-Language aligned with the Windows/Chrome-124 UA above
+    // (a mismatch between UA and client hints is itself a bot tell).
+    extraHTTPHeaders: {
+      "Accept-Language": "en-SG,en;q=0.9",
+      "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+    },
   });
+
+  if (proxyCreds) {
+    logger.info("main", "proxy_enabled", { server: proxyCreds.server }); // creds never logged
+  }
+
+  // Harden residual automation tells beyond --disable-blink-features.
+  // Runs in every page before site scripts.
+  await context.addInitScript(() => {
+    // Runs in the browser; reach browser-only globals via globalThis so this
+    // type-checks under the Node tsconfig without pulling in the DOM lib.
+    const g = globalThis as unknown as {
+      navigator: Navigator;
+      chrome?: unknown;
+      WebGLRenderingContext?: { prototype: { getParameter: (p: number) => unknown } };
+    };
+    Object.defineProperty(g.navigator, "webdriver", { get: () => undefined });
+    Object.defineProperty(g.navigator, "languages", { get: () => ["en-SG", "en"] });
+    Object.defineProperty(g.navigator, "plugins", {
+      get: () => [1, 2, 3, 4, 5].map((i) => ({ name: `Plugin ${i}` })),
+    });
+    g.chrome = { runtime: {} };
+    const proto = g.WebGLRenderingContext?.prototype;
+    if (proto) {
+      const getParameter = proto.getParameter;
+      proto.getParameter = function (parameter: number) {
+        if (parameter === 37445) return "Intel Inc."; // UNMASKED_VENDOR_WEBGL
+        if (parameter === 37446) return "Intel Iris OpenGL Engine"; // UNMASKED_RENDERER_WEBGL
+        return getParameter.call(this, parameter);
+      };
+    }
+  });
+
+  // Drop image/media/font requests to cut proxy bandwidth (the single biggest
+  // cost lever) and speed each poll. Stylesheets/scripts are kept so layout-based
+  // visibility/enabled checks in the monitor stay reliable. Skipped when capturing
+  // DOM snapshots, which need images to be meaningful.
+  if (config.settings.blockHeavyAssets && !CLI_DEBUG_DOM && !config.settings.debugSnapshots) {
+    const BLOCKED_TYPES = new Set(["image", "media", "font"]);
+    await context.route("**/*", (route) => {
+      if (BLOCKED_TYPES.has(route.request().resourceType())) {
+        void route.abort();
+      } else {
+        void route.continue();
+      }
+    });
+  }
 
   const controller = new AbortController();
 

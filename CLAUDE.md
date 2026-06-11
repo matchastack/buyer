@@ -28,7 +28,11 @@ npx vitest run tests/decision.test.ts
 npx vitest run -t "returns proceed=false in dry-run mode"
 ```
 
-First-time setup: copy `config.example.json` → `config.json` and `.env.example` → `.env`. Both are git-ignored. Credentials (`LAZADA_EMAIL`, `LAZADA_PASSWORD`) MUST come from env vars — `config.ts` rejects any `credentials`/`email`/`password` key found in `config.json`.
+First-time setup: copy `config.example.json` → `config.json` and `.env.example` → `.env`. Both are git-ignored. Credentials (`LAZADA_EMAIL`, `LAZADA_PASSWORD`) MUST come from env vars — `config.ts` rejects any `credentials`/`email`/`password` key found in `config.json`. The same rule covers the optional proxy: `PROXY_USERNAME`/`PROXY_PASSWORD` are env-only (the non-secret `PROXY_SERVER`/`settings.proxy.server` may live in config).
+
+### Anti-bot resilience (proxy + stealth)
+
+Datacenter IPs are flagged by Lazada/Alibaba's anti-bot stack almost immediately under repeated polling, so the most effective mitigation is a **residential proxy**, configured via env vars (`PROXY_SERVER`, `PROXY_USERNAME`, `PROXY_PASSWORD`) and/or `settings.proxy.server`. Proxy is fully optional and **all-or-nothing**: `loadProxyCredentials()` returns `null` when unset (run proxy-less) and throws if only partially set, so a half-configured proxy can never silently leak the real IP. Use a **Singapore, sticky** session — the app shares one `BrowserContext` across all workers, so one stable IP for the whole run is correct (rotating mid-session would break the logged-in cookies). On top of the proxy, `index.ts` hardens the context fingerprint (an `addInitScript` patching `navigator.webdriver`/`languages`/`plugins`, `window.chrome`, and WebGL vendor/renderer) and sends UA-consistent client-hint headers. `settings.blockHeavyAssets` (default `true`) aborts image/media/font requests to cut proxy bandwidth ~10× and speed each poll; it is auto-disabled when capturing DOM snapshots (`--debug-dom`/`debugSnapshots`) so screenshots stay meaningful. Note: a managed unblocker like Oxylabs Web Unblocker is intentionally **not** integrated — it returns stateless HTML and cannot drive the authenticated, interactive PayNow checkout.
 
 ## Architecture
 
@@ -45,8 +49,8 @@ config + env  ──►  auth (load/restore session, login if needed)
 
 ### Module roles
 
-- **`index.ts`** — Calls `dotenv.config()` to load `.env`, validates config, launches Chromium with anti-automation flags, restores session, spawns one `runItemWorker` per item. SIGINT/SIGTERM trigger graceful shutdown that saves session and closes browser.
-- **`config.ts`** — Loads + validates `config.json`. `loadCredentials()` is the only path to env-var credentials and throws if missing. Strict key allow-listing — unknown keys throw. `dryRun` defaults to `true`.
+- **`index.ts`** — Calls `dotenv.config()` to load `.env`, validates config, launches Chromium with anti-automation flags, restores session, spawns one `runItemWorker` per item. Wires the optional residential proxy into `newContext`, installs the stealth `addInitScript`, sets UA-consistent client-hint headers, and registers the `blockHeavyAssets` route handler. SIGINT/SIGTERM trigger graceful shutdown that saves session and closes browser.
+- **`config.ts`** — Loads + validates `config.json`. `loadCredentials()` is the only path to env-var credentials and throws if missing; `loadProxyCredentials()` is the equivalent for the optional proxy (returns `null` when unset, throws on partial config). Strict key allow-listing — unknown keys throw (including inside the nested `settings.proxy`, which also rejects `username`/`password`). `dryRun` defaults to `true`; `blockHeavyAssets` defaults to `true`.
 - **`auth.ts`** — Session cookies persisted to disk with mode `0o600`. `detectChallenge` checks URL patterns (`/baxia/`, `/block`, `/robot`, `captcha`, `/cdn-cgi/challenge-platform/`, `/awswaf/`, `/sec/`) and DOM markers (captcha frames, slider, rate-limit pages). Any challenge throws `ChallengeDetectedError`.
 - **`monitor.ts`** — `waitForStock` polls a product page at `checkIntervalMs` with an interruptible sleep (checks `AbortSignal` every 500ms). Never throws on transient page errors; returns `StockCheckResult` with status `unknown` so the caller decides. Returns immediately on `anti_bot` or `login_required` so the worker can bail out.
 - **`decision.ts`** — **Pure functions only.** No I/O, no Playwright, no fs, no console. `shouldProceed`, `isPriceAcceptable`, `computeBackoff`, `formatOrderSummary`. Keep this discipline — these are the unit-test core. Note: `isPriceAcceptable(null, …)` returns `true` (unknown price is not a skip reason — the user controls payment via the PayNow QR).
@@ -61,7 +65,7 @@ config + env  ──►  auth (load/restore session, login if needed)
 
 ### Cross-cutting invariants
 
-- **Credentials never touch `config.json` or logs.** `config.ts` rejects credential keys at the top level. After login, `auth.ts` overwrites the in-memory password string immediately.
+- **Credentials never touch `config.json` or logs.** `config.ts` rejects credential keys at the top level and inside `settings.proxy`. Proxy username/password are env-only (`PROXY_USERNAME`/`PROXY_PASSWORD`); `index.ts` logs only the proxy server, never the creds. After login, `auth.ts` overwrites the in-memory password string immediately.
 - **Dry-run defaults to true** at both `DEFAULTS` (config.ts) and the example config. Live purchases require explicitly setting `"dryRun": false` AND not passing `--dry-run`. CLI flag always wins (force-enables dry-run).
 - **Selector additions go through the abstraction.** Don't inline `page.locator("…")` calls outside `selectors.ts`/`browser-actions.ts`. Add a new `SelectorSet` to the relevant group in `SELECTORS` with multiple candidates and pick the right `required` flag.
 - **Payment is always PayNow.** `checkout.ts` hardcodes the method to `"paynow"` regardless of config. Lazada displays a QR code after Place Order is clicked; the user scans it to transfer funds. This is the final human confirmation step.

@@ -28,6 +28,7 @@
     "logDir": "logs",
     "approvalMethod": "stdin",
     "debugSnapshots": false,
-    "workerStartDelayMs": 5000
+    "workerStartDelayMs": 5000,
+    "blockHeavyAssets": true
   }
 }
