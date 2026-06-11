@@ -101,6 +101,7 @@ const DEFAULTS: Settings = {
   buyMaxRetries: 5,                // Fast OOS retries on the buy path (traffic vs sellout)
   buyRetryBaseMs: 400,             // Sub-second backoff so retries fit the drop window
   buyRetryMaxMs: 2_000,
+  workerStartDelayMs: 0,  // 0 = no stagger; set to e.g. 5000 to stagger worker startup
 };
 
 // ---------------------------------------------------------------------------
@@ -248,6 +249,13 @@ function validateSettings(raw: Record<string, unknown>): Settings {
   }
   if (merged.buyRetryMaxMs < merged.buyRetryBaseMs) {
     throw new ConfigValidationError("settings.buyRetryMaxMs must be >= buyRetryBaseMs");
+  }
+  if (
+    typeof merged.workerStartDelayMs !== "number" ||
+    !Number.isFinite(merged.workerStartDelayMs) ||
+    merged.workerStartDelayMs < 0
+  ) {
+    throw new ConfigValidationError("settings.workerStartDelayMs must be a non-negative number");
   }
 
   return merged;

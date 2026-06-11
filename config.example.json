@@ -24,9 +24,9 @@
     "retryBackoffBaseMs": 2000,
     "retryBackoffMaxMs": 30000,
     "paymentMethod": "paynow",
-    "logDir": "logs",
     "healthPort": 0,
     "dataDir": "data",
+    "logDir": "logs",
     "approvalMethod": "stdin",
     "debugSnapshots": false,
     "stealth": true,
@@ -41,6 +41,7 @@
     "wishlistPollIntervalMs": 1500,
     "buyMaxRetries": 5,
     "buyRetryBaseMs": 400,
-    "buyRetryMaxMs": 2000
+    "buyRetryMaxMs": 2000,
+    "workerStartDelayMs": 5000
   }
 }

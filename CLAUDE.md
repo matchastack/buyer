@@ -102,3 +102,13 @@ In wishlist mode the watcher is a single point of failure: on `login_required` i
   - `data/logs/audit-YYYY-MM-DD.log` — JSONL audit trail
   - `data/debug/<item>-<timestamp>.png` / `.html` — DOM snapshots (only when `--debug-dom` is active)
 - `dist/` — tsc output
+
+## Development workflow
+
+For every task:
+
+1. Sync the feature branch with the latest `main`: `git fetch origin main && git merge origin/main`
+2. Complete the task
+3. Update all relevant documentation (CLAUDE.md, inline comments, config.example.json)
+4. Sync with `main` again and resolve any merge conflicts before pushing
+5. Create a pull request

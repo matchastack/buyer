@@ -74,6 +74,7 @@ export interface Settings {
   challengeBackoffBaseMs: number; // base backoff after a monitoring-phase challenge (ms)
   challengeBackoffMaxMs: number;  // cap for monitoring-phase challenge backoff (ms)
   maxConsecutiveChallenges: number; // circuit breaker: give up after this many challenges with no successful check between
+  workerStartDelayMs: number;     // Extra delay multiplied by worker index before first navigation (ms)
 }
 
 // Options controlling how the monitor reacts to anti-bot challenges.

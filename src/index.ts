@@ -40,6 +40,19 @@ const CLI_AUTH_DEBUG = args.includes("--auth-debug");
 const AUTH_DEBUG_PAUSE_MS = 2_000;
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Resolves after `ms` milliseconds, or immediately if the signal is aborted. */
+function startupDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (ms <= 0 || signal.aborted) { resolve(); return; }
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Per-item worker
 // ---------------------------------------------------------------------------
 
@@ -549,6 +562,7 @@ async function main(): Promise<void> {
   logger.info("main", "workers_starting", {
     mode: config.settings.monitorMode,
     items: config.items.map((i) => i.name),
+    workerStartDelayMs: config.settings.workerStartDelayMs,
   });
 
   let results: PromiseSettledResult<void>[];
@@ -621,17 +635,24 @@ async function main(): Promise<void> {
     results = await Promise.allSettled([watcher, ...buyers]);
   } else {
     const workers = config.items.map((item, index) =>
-      runItemWorker(
-        item,
-        config,
-        context,
-        rateLimiter,
-        logger,
-        controller.signal,
-        itemStatuses[index]!,
-        runtimeStatus,
-        debugDir
-      )
+      (async () => {
+        const staggerMs = index * config.settings.workerStartDelayMs;
+        if (staggerMs > 0) {
+          logger.info("main", "worker_startup_stagger", { item: item.name, delayMs: staggerMs });
+          await startupDelay(staggerMs, controller.signal);
+        }
+        await runItemWorker(
+          item,
+          config,
+          context,
+          rateLimiter,
+          logger,
+          controller.signal,
+          itemStatuses[index]!,
+          runtimeStatus,
+          debugDir
+        );
+      })()
     );
 
     results = await Promise.allSettled(workers);
