@@ -114,6 +114,8 @@ async function runItemWorker(
 
     // The monitor leaves `page` on the in-stock product page, so the checkout
     // can buy from it directly when fastCheckout is enabled — no reload, no wait.
+    // Clock starts now: in-stock is already detected (waitForStock returned it).
+    const instockAt = Date.now();
     runtimeStatus.totalCheckoutAttempts++;
     const checkoutResult = await checkout(
       page,
@@ -123,6 +125,13 @@ async function runItemWorker(
       logger,
       config.settings.fastCheckout
     );
+
+    logger.info("worker", "instock_to_confirm", {
+      item: item.name,
+      success: checkoutResult.success,
+      durationMs: Date.now() - instockAt,
+      orderNumber: checkoutResult.orderNumber,
+    });
 
     if (checkoutResult.success) {
       runtimeStatus.totalPurchases++;
@@ -173,6 +182,8 @@ async function runBuyerWorker(
     await gate.waitForRestock(signal);
     if (signal.aborted) return;
 
+    // Clock starts at the restock signal — this is the in-stock detection moment.
+    const instockAt = Date.now();
     logger.info("buyer", "restock_signal_received", { item: item.name, productId });
     itemStatus.lastChecked = new Date().toISOString();
     runtimeStatus.totalCheckoutAttempts++;
@@ -182,8 +193,18 @@ async function runBuyerWorker(
       // the reload skips the rate limiter and reuses the warm session. The first
       // checkout attempt then acts on this just-loaded page (alreadyOnProductPage).
       await navigateTo(page, item.url, logger);
+      const reloadMs = Date.now() - instockAt;
 
       const checkoutResult = await checkout(page, item, config, rateLimiter, logger, true, fastRetry);
+
+      logger.info("buyer", "instock_to_confirm", {
+        item: item.name,
+        productId,
+        success: checkoutResult.success,
+        durationMs: Date.now() - instockAt,
+        reloadMs,
+        orderNumber: checkoutResult.orderNumber,
+      });
 
       if (checkoutResult.success) {
         runtimeStatus.totalPurchases++;

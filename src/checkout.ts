@@ -19,6 +19,7 @@ import { RateLimiter } from "./rate-limiter";
 import { SELECTORS, resolveSelector } from "./selectors";
 import { detectChallenge, ChallengeDetectedError } from "./auth";
 import { navigateTo, clickElement, isVisible, extractText, waitForUrl } from "./browser-actions";
+import { PhaseTimer } from "./timing";
 
 const MODULE = "checkout";
 const LAZADA_DOMAIN = "www.lazada.sg";
@@ -91,6 +92,7 @@ async function attemptCheckout(
   attempt: number,
   skipInitialNav: boolean
 ): Promise<CheckoutResult> {
+  const timer = new PhaseTimer();
   try {
     // Fast path: the page is already on the in-stock product page (just seen by
     // the monitor). Skip the rate-limit wait and re-navigation — every second
@@ -101,6 +103,7 @@ async function attemptCheckout(
       await rateLimiter.acquire(LAZADA_DOMAIN);
       await navigateTo(page, item.url, logger);
     }
+    timer.mark("nav");
 
     const challenge = await detectChallenge(page, logger);
     if (challenge) throw new ChallengeDetectedError(challenge);
@@ -111,8 +114,15 @@ async function attemptCheckout(
 
     // Buy Now only — no Add to Cart fallback
     const buyNowVisible = await isVisible(page, SELECTORS.product.buyNowButton, logger, 3_000);
+    timer.mark("locate_buy_now");
     if (!buyNowVisible) {
       logger.warn(MODULE, "buy_now_unavailable", { item: item.name, attempt });
+      logger.info(MODULE, "checkout_timing", {
+        item: item.name,
+        attempt,
+        success: false,
+        ...timer.summary(),
+      });
       return { success: false, orderNumber: null, error: "Buy Now button not found" };
     }
 
@@ -125,16 +135,26 @@ async function attemptCheckout(
       15_000,
       logger
     );
+    timer.mark("buy_now_to_checkout");
 
     logger.info(MODULE, "on_checkout_page", { item: item.name });
 
     await selectPaymentMethod(page, logger);
+    timer.mark("select_payment");
 
     // Place order — Lazada will display a PayNow QR for the user to scan
     await clickElement(page, SELECTORS.checkout.placeOrderButton, logger);
     logger.info(MODULE, "place_order_clicked", { item: item.name });
 
-    return await waitForConfirmation(page, item.name, logger);
+    const result = await waitForConfirmation(page, item.name, logger);
+    timer.mark("place_order_to_confirm");
+    logger.info(MODULE, "checkout_timing", {
+      item: item.name,
+      attempt,
+      success: result.success,
+      ...timer.summary(),
+    });
+    return result;
   } catch (err) {
     if (err instanceof ChallengeDetectedError) {
       logger.error(MODULE, "anti_bot_challenge_during_checkout", {
