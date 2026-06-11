@@ -160,10 +160,91 @@ describe("loadConfig", () => {
     expect(() => loadConfig(file)).toThrow(/quantity/i);
   });
 
-  it("throws when checkIntervalMs is below 5000", () => {
-    const bad = { ...VALID_CONFIG, settings: { checkIntervalMs: 1_000, dryRun: true } };
+  it("throws when checkIntervalMs is below 1000", () => {
+    const bad = { ...VALID_CONFIG, settings: { checkIntervalMs: 500, dryRun: true } };
     const file = writeTmpConfig(bad);
     expect(() => loadConfig(file)).toThrow(/checkIntervalMs/i);
+  });
+
+  it("accepts an aggressive checkIntervalMs at the 1000ms floor", () => {
+    const cfg = { ...VALID_CONFIG, settings: { checkIntervalMs: 1_000, dryRun: true } };
+    const file = writeTmpConfig(cfg);
+    expect(loadConfig(file).settings.checkIntervalMs).toBe(1_000);
+  });
+
+  it("defaults pollSettleMs when not specified", () => {
+    const file = writeTmpConfig(VALID_CONFIG);
+    expect(loadConfig(file).settings.pollSettleMs).toBeGreaterThan(0);
+  });
+
+  it("accepts pollSettleMs = 0 (skip settle entirely)", () => {
+    const cfg = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, pollSettleMs: 0 } };
+    const file = writeTmpConfig(cfg);
+    expect(loadConfig(file).settings.pollSettleMs).toBe(0);
+  });
+
+  it("throws when pollSettleMs is negative", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, pollSettleMs: -1 } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/pollSettleMs/i);
+  });
+
+  it("throws when minPageLoadDelayMs is below 250", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, minPageLoadDelayMs: 100 } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/minPageLoadDelayMs/i);
+  });
+
+  it("defaults monitorMode to per-item", () => {
+    const file = writeTmpConfig(VALID_CONFIG);
+    expect(loadConfig(file).settings.monitorMode).toBe("per-item");
+  });
+
+  it("throws on an invalid monitorMode", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, monitorMode: "both" } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/monitorMode/i);
+  });
+
+  it("throws when wishlistUrl is not https", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, wishlistUrl: "http://x" } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/wishlistUrl/i);
+  });
+
+  it("defaults loginUrl to the member.lazada.sg login page", () => {
+    const file = writeTmpConfig(VALID_CONFIG);
+    expect(loadConfig(file).settings.loginUrl).toBe("https://member.lazada.sg/user/login");
+  });
+
+  it("throws when loginUrl is not https", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, loginUrl: "ftp://x" } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/loginUrl/i);
+  });
+
+  it("throws when buyRetryMaxMs is below buyRetryBaseMs", () => {
+    const bad = {
+      ...VALID_CONFIG,
+      settings: { ...VALID_CONFIG.settings, buyRetryBaseMs: 1000, buyRetryMaxMs: 500 },
+    };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/buyRetryMaxMs/i);
+  });
+
+  it("accepts wishlist mode when every item URL has a product id", () => {
+    const cfg = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, monitorMode: "wishlist" } };
+    const file = writeTmpConfig(cfg);
+    expect(loadConfig(file).settings.monitorMode).toBe("wishlist");
+  });
+
+  it("throws in wishlist mode when an item URL has no extractable product id", () => {
+    const bad = {
+      items: [{ url: "https://www.lazada.sg/shop/pokemon-store", name: "No Id", maxPrice: 10, quantity: 1 }],
+      settings: { dryRun: true, monitorMode: "wishlist" },
+    };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/product id/i);
   });
 
   it("throws for unknown settings key", () => {

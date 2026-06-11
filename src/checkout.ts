@@ -3,26 +3,53 @@
  *
  * Flow per attempt:
  *   1. Navigate to product page → click Buy Now (no Add to Cart fallback)
- *   2. Wait for checkout page
- *   3. Select PayNow
- *   4. Click Place Order
- *   5. Wait for confirmation (Lazada sends a PayNow QR — user scans to complete payment)
+ *   2. Wait for the checkout page's Place Order CTA (element gate — no URL
+ *      assumption; Lazada SG checkout is a separate HOST, not a /checkout path)
+ *   3. Confirm PayNow is the selected method — fail-closed: if unconfirmable,
+ *      abort WITHOUT placing the order (guardrail against a saved card charge)
+ *   4. Click Place Order Now
+ *   5. Wait for the outcome: classic order-success page OR the PayNow QR /
+ *      cashier page (the scan-to-pay handoff — counts as success; user pays)
  *
  * Anti-bot challenges halt checkout immediately.
  * Dry-run guard is the FIRST check — aborts before any page navigation.
  */
 
+import * as path from "path";
 import { Page } from "playwright";
-import { Item, Config, CheckoutResult } from "./types";
+import { Item, Config, CheckoutResult, RetryProfile } from "./types";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
-import { SELECTORS, resolveSelector } from "./selectors";
+import { SELECTORS, resolveSelector, waitForSelectorSet, SelectorNotFoundError } from "./selectors";
 import { detectChallenge, ChallengeDetectedError } from "./auth";
-import { navigateTo, clickElement, isVisible, extractText, waitForUrl } from "./browser-actions";
+import { navigateTo, clickElement, extractText } from "./browser-actions";
+import { captureNamedSnapshot, describeProductSelectors } from "./diagnostics";
+import { PhaseTimer } from "./timing";
 
 const MODULE = "checkout";
 const LAZADA_DOMAIN = "www.lazada.sg";
 const PAYMENT_METHOD = "paynow";
+
+// Lazada pages are client-rendered: navigateTo returns at domcontentloaded but
+// the buy box / checkout CTAs hydrate hundreds of ms later. These are the
+// bounded waits for each stage (waitForSelectorSet returns the moment the
+// element appears, so a fast render costs a single pass).
+const BUY_NOW_WAIT_MS = 3_000;
+// Absorbs the Buy Now → checkout navigation too: arrival on the checkout page
+// is detected by the Place Order CTA appearing, NOT by URL (Lazada SG checkout
+// lives on the checkout.lazada.sg HOST with pathname "/", and its load event
+// may never fire — a path-based waitForURL gate timed out on a live run).
+const CHECKOUT_READY_WAIT_MS = 15_000;
+const PAYMENT_OPTIONS_WAIT_MS = 8_000;
+const CONFIRMATION_WAIT_MS = 20_000;
+
+// Fail-closed guardrail (dev phase): the checkout page offers a saved card next
+// to PayNow, so Place Order is NEVER clicked unless PayNow is positively
+// confirmed as the selected method. This sentinel marks that abort; the retry
+// loop treats it as non-retryable (re-running cannot fix a selector mismatch
+// and would stack abandoned checkouts).
+const PAYNOW_NOT_CONFIRMED_ERROR =
+  "PayNow could not be confirmed as the selected payment method — order NOT placed";
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -33,7 +60,9 @@ export async function checkout(
   item: Item,
   config: Config,
   rateLimiter: RateLimiter,
-  logger: Logger
+  logger: Logger,
+  alreadyOnProductPage = false,
+  retry?: RetryProfile
 ): Promise<CheckoutResult> {
   // ── Dry-run guard — must be first ──────────────────────────────────────────
   if (config.settings.dryRun) {
@@ -41,27 +70,50 @@ export async function checkout(
     return { success: false, orderNumber: null, error: "dry-run mode" };
   }
 
-  logger.info(MODULE, "checkout_start", { item: item.name });
+  // Default to the per-item retry profile so existing callers are unchanged;
+  // wishlist buyers pass a fast profile to keep retries inside the drop window.
+  const profile: RetryProfile = retry ?? {
+    maxRetries: config.settings.maxRetries,
+    baseMs: config.settings.retryBackoffBaseMs,
+    maxMs: config.settings.retryBackoffMaxMs,
+  };
 
-  for (let attempt = 1; attempt <= config.settings.maxRetries; attempt++) {
-    const result = await attemptCheckout(page, item, config, rateLimiter, logger, attempt);
+  logger.info(MODULE, "checkout_start", { item: item.name, fastPath: alreadyOnProductPage });
+
+  for (let attempt = 1; attempt <= profile.maxRetries; attempt++) {
+    // Only the very first attempt can act on the live in-stock page. Any retry
+    // means the previous attempt navigated away, so it must reload (and pace).
+    const skipInitialNav = alreadyOnProductPage && attempt === 1;
+    const result = await attemptCheckout(page, item, config, rateLimiter, logger, attempt, skipInitialNav);
 
     if (result.success) return result;
 
-    if (attempt < config.settings.maxRetries) {
+    // Fail-closed: PayNow unconfirmed is non-retryable (its own forensic
+    // snapshot was already captured in ensurePayNowSelected's failure path).
+    if (result.error === PAYNOW_NOT_CONFIRMED_ERROR) return result;
+
+    if (attempt < profile.maxRetries) {
       const backoffMs = Math.min(
-        config.settings.retryBackoffBaseMs * Math.pow(2, attempt - 1),
-        config.settings.retryBackoffMaxMs
+        profile.baseMs * Math.pow(2, attempt - 1),
+        profile.maxMs
       );
       logger.warn(MODULE, "retry_backoff", { item: item.name, attempt, backoffMs });
       await sleep(backoffMs);
     }
   }
 
+  // Terminal failure: capture the page exactly as the last attempt saw it
+  // (screenshot + HTML + per-selector match report). This is the only moment
+  // the evidence exists, so it is always on — not gated by debugSnapshots.
+  const failureDir = path.join(config.settings.dataDir, "debug");
+  logger.warn(MODULE, "capturing_failure_snapshot", { item: item.name, dir: failureDir });
+  await captureNamedSnapshot(page, `checkout-failed-${item.name}`, failureDir, logger);
+  await describeProductSelectors(page, logger);
+
   return {
     success: false,
     orderNumber: null,
-    error: `Failed after ${config.settings.maxRetries} attempt(s)`,
+    error: `Failed after ${profile.maxRetries} attempt(s)`,
   };
 }
 
@@ -75,57 +127,111 @@ async function attemptCheckout(
   config: Config,
   rateLimiter: RateLimiter,
   logger: Logger,
-  attempt: number
+  attempt: number,
+  skipInitialNav: boolean
 ): Promise<CheckoutResult> {
+  const timer = new PhaseTimer();
+  const debugDir = path.join(config.settings.dataDir, "debug");
   try {
-    await rateLimiter.acquire(LAZADA_DOMAIN);
-    await navigateTo(page, item.url, logger);
+    // Fast path: the page is already on the in-stock product page (just seen by
+    // the monitor). Skip the rate-limit wait and re-navigation — every second
+    // here is a second the item can sell out. The QR/Place-Order flow still runs.
+    if (skipInitialNav) {
+      logger.info(MODULE, "fast_path_using_live_page", { item: item.name });
+    } else {
+      await rateLimiter.acquire(LAZADA_DOMAIN);
+      await navigateTo(page, item.url, logger);
+    }
+    timer.mark("nav");
 
     const challenge = await detectChallenge(page, logger);
     if (challenge) throw new ChallengeDetectedError(challenge);
 
-    if (item.quantity > 1) {
-      await setQuantity(page, item.quantity, logger);
+    // Buy Now only — no Add to Cart fallback. The buy box hydrates after
+    // domcontentloaded, so this WAITS (bounded) for a candidate to appear
+    // instead of sampling the instant page state.
+    const buyNow = await waitForSelectorSet(
+      page,
+      SELECTORS.product.buyNowButton,
+      BUY_NOW_WAIT_MS
+    );
+    timer.mark("locate_buy_now");
+    if (!buyNow) {
+      logger.warn(MODULE, "buy_now_unavailable", { item: item.name, attempt, url: page.url() });
+      logger.info(MODULE, "checkout_timing", {
+        item: item.name,
+        attempt,
+        success: false,
+        ...timer.summary(),
+      });
+      return { success: false, orderNumber: null, error: "Buy Now button not found" };
     }
 
-    // Buy Now only — no Add to Cart fallback
-    const buyNowVisible = await isVisible(page, SELECTORS.product.buyNowButton, logger, 3_000);
-    if (!buyNowVisible) {
-      logger.warn(MODULE, "buy_now_unavailable", { item: item.name, attempt });
-      return { success: false, orderNumber: null, error: "Buy Now button not found" };
+    // Quantity after the buy box is up — the input hydrates with it.
+    if (item.quantity > 1) {
+      await setQuantity(page, item.quantity, logger);
     }
 
     await clickElement(page, SELECTORS.product.buyNowButton, logger);
     logger.info(MODULE, "clicked_buy_now", { item: item.name, attempt });
 
-    await waitForUrl(
-      page,
-      (url) => url.pathname.includes("/checkout"),
-      15_000,
-      logger
-    );
+    // Element gate: we are "on the checkout page" when the Place Order CTA is
+    // visible. No URL assumption — see CHECKOUT_READY_WAIT_MS note. Challenge-
+    // aware: an anti-bot punish redirect here throws immediately instead of
+    // burning the full wait (the live x5sec punish hit exactly this window).
+    await waitForCheckoutReady(page, logger);
+    timer.mark("buy_now_to_checkout");
 
-    logger.info(MODULE, "on_checkout_page", { item: item.name });
+    logger.info(MODULE, "on_checkout_page", { item: item.name, url: page.url() });
 
-    await selectPaymentMethod(page, logger);
+    const payNowConfirmed = await ensurePayNowSelected(page, logger);
+    timer.mark("select_payment");
+    if (!payNowConfirmed) {
+      logger.error(MODULE, "paynow_not_confirmed", {
+        item: item.name,
+        attempt,
+        url: page.url(),
+      });
+      await captureNamedSnapshot(page, `paynow-not-confirmed-${item.name}`, debugDir, logger);
+      return { success: false, orderNumber: null, error: PAYNOW_NOT_CONFIRMED_ERROR };
+    }
 
     // Place order — Lazada will display a PayNow QR for the user to scan
+    const urlAtPlaceOrder = page.url();
     await clickElement(page, SELECTORS.checkout.placeOrderButton, logger);
     logger.info(MODULE, "place_order_clicked", { item: item.name });
 
-    return await waitForConfirmation(page, item.name, logger);
+    const result = await waitForConfirmation(page, item.name, logger, urlAtPlaceOrder, debugDir);
+    timer.mark("place_order_to_confirm");
+    logger.info(MODULE, "checkout_timing", {
+      item: item.name,
+      attempt,
+      success: result.success,
+      ...timer.summary(),
+    });
+    return result;
   } catch (err) {
     if (err instanceof ChallengeDetectedError) {
       logger.error(MODULE, "anti_bot_challenge_during_checkout", {
         item: item.name,
         attempt,
         type: err.challenge.type,
+        url: err.challenge.url,
       });
+      await captureNamedSnapshot(page, `checkout-challenge-${item.name}`, debugDir, logger);
       throw err; // Propagate — caller (index.ts) initiates shutdown
     }
 
+    // Always-on per-attempt snapshot: the terminal snapshot only preserves the
+    // LAST attempt's page, but the first attempt is usually the informative one.
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error(MODULE, "checkout_attempt_failed", { item: item.name, attempt, error: errMsg });
+    logger.error(MODULE, "checkout_attempt_failed", {
+      item: item.name,
+      attempt,
+      url: page.url(),
+      error: errMsg,
+    });
+    await captureNamedSnapshot(page, `checkout-failed-${item.name}-attempt${attempt}`, debugDir, logger);
     return { success: false, orderNumber: null, error: errMsg };
   }
 }
@@ -146,47 +252,164 @@ async function setQuantity(page: Page, quantity: number, logger: Logger): Promis
   logger.debug(MODULE, "quantity_set", { quantity });
 }
 
-async function selectPaymentMethod(page: Page, logger: Logger): Promise<void> {
-  for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
-    const options = page.locator(candidate);
-    const count = await options.count().catch(() => 0);
-    if (count === 0) continue;
+/**
+ * Waits (bounded) for the Buy Now → checkout navigation to land: ready when the
+ * Place Order CTA is visible. Each pass also runs detectChallenge so an
+ * anti-bot redirect (punish/captcha) throws ChallengeDetectedError immediately
+ * — without this, a punished session looks like a selector timeout and the
+ * retry loop re-clicks Buy Now into the same flagged session.
+ */
+async function waitForCheckoutReady(page: Page, logger: Logger): Promise<void> {
+  const set = SELECTORS.checkout.placeOrderButton;
+  const deadline = Date.now() + CHECKOUT_READY_WAIT_MS;
 
-    for (let i = 0; i < count; i++) {
-      const option = options.nth(i);
-      const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
+  do {
+    const resolved = await resolveSelector(page, set).catch(() => null);
+    if (resolved) return;
 
-      if (text.includes("paynow")) {
-        await option.click().catch(() => {});
-        logger.info(MODULE, "payment_method_selected", { paymentMethod: PAYMENT_METHOD });
-        await page.waitForTimeout(1_000);
-        return;
-      }
-    }
-    break; // found elements with this candidate but no PayNow match
-  }
+    const challenge = await detectChallenge(page, logger);
+    if (challenge) throw new ChallengeDetectedError(challenge);
 
-  logger.warn(MODULE, "paynow_option_not_found");
+    await page.waitForTimeout(250);
+  } while (Date.now() < deadline);
+
+  // Same error waitForSelectorSet throws for a required set, so the retry
+  // loop and logs are unchanged.
+  throw new SelectorNotFoundError(set.description, set.candidates);
 }
 
+/**
+ * Reads the currently selected payment method via the indicator selector set
+ * and returns true iff its text names PayNow. Multiple indicator strategies
+ * (selected/active/checked classes, aria, :checked radios) so one DOM shape
+ * change doesn't blind the check.
+ */
+async function isPayNowConfirmed(page: Page): Promise<boolean> {
+  for (const candidate of SELECTORS.checkout.paymentSelectedIndicator.candidates) {
+    const matches = page.locator(candidate);
+    const count = await matches.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const el = matches.nth(i);
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) continue;
+      const text = ((await el.textContent().catch(() => "")) ?? "").toLowerCase();
+      if (text.includes(PAYMENT_METHOD)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Ensures PayNow is the selected payment method: confirms via the selected
+ * indicator first (PayNow is often pre-selected), otherwise finds and clicks
+ * the PayNow row and re-checks. Returns false at the deadline — the caller
+ * then ABORTS without placing the order (fail-closed guardrail).
+ */
+async function ensurePayNowSelected(page: Page, logger: Logger): Promise<boolean> {
+  const deadline = Date.now() + PAYMENT_OPTIONS_WAIT_MS;
+  let lastClickAt = 0;
+  let clicked = false;
+
+  do {
+    // Already selected? (live page pre-selects the saved CARD, not PayNow —
+    // so the click below is the expected path, and this check is the proof
+    // the click landed.)
+    if (await isPayNowConfirmed(page)) {
+      logger.info(MODULE, "payment_method_selected", {
+        paymentMethod: PAYMENT_METHOD,
+        clicked,
+      });
+      return true;
+    }
+
+    // Find a PayNow row among the option candidates and click it. Options
+    // render progressively, so keep re-scanning until the deadline — but click
+    // at most once per second: the card needs a re-render beat to flip to
+    // selected, and hammering it risks toggling the cashier widget.
+    if (Date.now() - lastClickAt >= 1_000) {
+      candidateScan: for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
+        const options = page.locator(candidate);
+        const count = await options.count().catch(() => 0);
+
+        for (let i = 0; i < count; i++) {
+          const option = options.nth(i);
+          const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
+
+          if (text.includes(PAYMENT_METHOD)) {
+            await option.click().catch(() => {});
+            lastClickAt = Date.now();
+            clicked = true;
+            logger.debug(MODULE, "paynow_row_clicked", { candidate });
+            break candidateScan; // re-check the indicator before clicking again
+          }
+        }
+      }
+    }
+
+    await page.waitForTimeout(250);
+  } while (Date.now() < deadline);
+
+  return false;
+}
+
+/**
+ * Polls (bounded) for the outcome of Place Order. Two success shapes:
+ *  - classic "Thank you" order page (successHeading) — extract the order number;
+ *  - the PayNow QR / cashier page (paymentPending markers, or a navigation to a
+ *    cashier/pay URL) — this is the scan-to-pay handoff and counts as success
+ *    with no order number. The checkout job is complete at this point; the QR
+ *    stays on screen for the user.
+ * Either way an always-on snapshot is saved as the audit/QR record.
+ */
 async function waitForConfirmation(
   page: Page,
   itemName: string,
-  logger: Logger
+  logger: Logger,
+  urlAtPlaceOrder: string,
+  debugDir: string
 ): Promise<CheckoutResult> {
-  const resolved = await resolveSelector(page, SELECTORS.confirmation.successHeading, 20_000).catch(
-    () => null
-  );
+  const deadline = Date.now() + CONFIRMATION_WAIT_MS;
 
-  if (resolved !== null) {
-    const orderNumberText = await extractText(page, SELECTORS.confirmation.orderNumber, logger);
-    const orderNumber = orderNumberText?.trim().replace(/[^A-Za-z0-9-]/g, "") ?? null;
+  do {
+    const heading = await resolveSelector(page, SELECTORS.confirmation.successHeading).catch(
+      () => null
+    );
+    if (heading) {
+      const orderNumberText = await extractText(page, SELECTORS.confirmation.orderNumber, logger);
+      const orderNumber = orderNumberText?.trim().replace(/[^A-Za-z0-9-]/g, "") ?? null;
 
-    logger.info(MODULE, "order_confirmed", { item: itemName, orderNumber });
-    return { success: true, orderNumber, error: null };
-  }
+      logger.info(MODULE, "order_confirmed", { item: itemName, orderNumber });
+      await captureNamedSnapshot(page, `order-confirmed-${itemName}`, debugDir, logger);
+      return { success: true, orderNumber, error: null };
+    }
 
-  if (page.url().includes("/checkout")) {
+    const qr = await resolveSelector(page, SELECTORS.confirmation.paymentPending).catch(
+      () => null
+    );
+    const url = page.url();
+    const movedToCashier = url !== urlAtPlaceOrder && /cashier|pay/i.test(url);
+    if (qr || movedToCashier) {
+      logger.info(MODULE, "paynow_qr_displayed", {
+        item: itemName,
+        url,
+        marker: qr?.selector ?? "url",
+      });
+      await captureNamedSnapshot(page, `order-confirmed-${itemName}`, debugDir, logger);
+      return { success: true, orderNumber: null, error: null };
+    }
+
+    // A punish/captcha redirect can equally follow Place Order — surface it
+    // immediately instead of timing out into a misleading "not detected".
+    const challenge = await detectChallenge(page, logger);
+    if (challenge) throw new ChallengeDetectedError(challenge);
+
+    await page.waitForTimeout(250);
+  } while (Date.now() < deadline);
+
+  // Deadline reached with neither success shape — scan once for an explicit
+  // failure banner (only now: words like "error" are too generic to gate the
+  // poll loop on while the QR may still be loading).
+  if (page.url() === urlAtPlaceOrder) {
     const bodyText = (await page.locator("body").textContent().catch(() => "")) ?? "";
     if (
       bodyText.toLowerCase().includes("failed") ||

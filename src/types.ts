@@ -23,6 +23,16 @@ export type PaymentMethodKey = "credit_card" | "cod" | "paynow" | string;
 
 export type ApprovalMethod = "stdin" | "telegram";
 
+export type MonitorMode = "wishlist" | "per-item";
+
+// Overridable retry profile for the checkout loop. Wishlist buyers pass a fast
+// profile; per-item mode falls back to the config.settings.retry* values.
+export interface RetryProfile {
+  maxRetries: number;
+  baseMs: number;
+  maxMs: number;
+}
+
 // ---------------------------------------------------------------------------
 // Configuration (loaded from config.json; credentials come from env vars)
 // ---------------------------------------------------------------------------
@@ -36,6 +46,7 @@ export interface Item {
 
 export interface Settings {
   checkIntervalMs: number;       // Base poll interval per item (ms)
+  pollSettleMs: number;          // Max wait for the page to render before evaluating a check (ms); adaptive, returns early
   minPageLoadDelayMs: number;    // Minimum delay between page loads (rate limiting)
   maxPageLoadDelayMs: number;    // Maximum delay (adds random jitter up to this)
   headless: boolean;             // false = visible browser (needed for manual CAPTCHA)
@@ -50,7 +61,28 @@ export interface Settings {
   approvalMethod: ApprovalMethod; // How to gate purchases: terminal stdin or Telegram bot
   healthPort: number;             // 0 = disabled; 1024–65535 = bind health HTTP server on 127.0.0.1
   debugSnapshots: boolean;        // true = write DOM snapshots + selector report to <dataDir>/debug on each check
+  stealth: boolean;               // true = inject fingerprint-masking init script to avoid tripping anti-bot
+  fastCheckout: boolean;          // true = buy on the already-loaded in-stock page (no re-navigation, no rate-limit wait)
+  monitorMode: MonitorMode;       // "per-item" = one PDP poll per item; "wishlist" = one wishlist watcher fans out to buyers
+  loginUrl: string;               // Lazada login page (Lazada moved auth to member.lazada.sg)
+  wishlistUrl: string;            // account wishlist page polled by the watcher in wishlist mode
+  wishlistPollIntervalMs: number; // poll cadence for the wishlist watcher (ms)
+  buyMaxRetries: number;          // wishlist buy-path attempt count (fast OOS retries)
+  buyRetryBaseMs: number;         // wishlist buy-path backoff base (ms) — fast, unlike the per-item retry profile
+  buyRetryMaxMs: number;          // wishlist buy-path backoff cap (ms)
+  surviveChallenges: boolean;     // true = back off and resume monitoring on an anti-bot challenge instead of halting
+  challengeBackoffBaseMs: number; // base backoff after a monitoring-phase challenge (ms)
+  challengeBackoffMaxMs: number;  // cap for monitoring-phase challenge backoff (ms)
+  maxConsecutiveChallenges: number; // circuit breaker: give up after this many challenges with no successful check between
   workerStartDelayMs: number;     // Extra delay multiplied by worker index before first navigation (ms)
+}
+
+// Options controlling how the monitor reacts to anti-bot challenges.
+export interface ChallengeSurvivalOptions {
+  surviveChallenges: boolean;
+  challengeBackoffBaseMs: number;
+  challengeBackoffMaxMs: number;
+  maxConsecutiveChallenges: number;
 }
 
 export interface Config {
