@@ -11,12 +11,13 @@ import { BrowserContext, Page } from "playwright";
 import * as fs from "fs";
 import { Logger } from "./logger";
 import { loadCredentials } from "./config";
+import { isChallengeUrl } from "./decision";
 import { SELECTORS } from "./selectors";
 import { resolveSelector } from "./selectors";
 import { fillInput, clickElement, waitForUrl } from "./browser-actions";
+import { captureNamedSnapshot } from "./diagnostics";
 
 const MODULE = "auth";
-const LOGIN_URL = "https://www.lazada.sg/customer/account/login/";
 const HOME_URL = "https://www.lazada.sg/";
 
 // ---------------------------------------------------------------------------
@@ -49,16 +50,9 @@ export async function detectChallenge(
 ): Promise<Challenge | null> {
   const url = page.url();
 
-  // URL-based detection (Lazada/Alibaba bot-challenge pages use known paths)
-  if (
-    url.includes("/baxia/") ||
-    url.includes("/block") ||
-    url.includes("/robot") ||
-    url.includes("captcha") ||
-    url.includes("/cdn-cgi/challenge-platform/") ||
-    url.includes("/awswaf/") ||
-    url.includes("/sec/")
-  ) {
+  // URL-based detection (Lazada/Alibaba bot-challenge pages use known paths —
+  // pattern list lives in decision.isChallengeUrl so it is unit-testable)
+  if (isChallengeUrl(url)) {
     const challenge: Challenge = { type: "captcha", url, detectedAt: new Date().toISOString() };
     logger.warn(MODULE, "challenge_detected_url", { url, type: challenge.type });
     return challenge;
@@ -98,19 +92,46 @@ export async function isLoggedIn(page: Page, logger: Logger): Promise<boolean> {
   const challenge = await detectChallenge(page, logger);
   if (challenge) throw new ChallengeDetectedError(challenge);
 
-  // If the login link is visible, we are NOT logged in
-  const loginLinkVisible = await resolveSelector(
-    page,
-    {
-      description: "Login link in site header (visible = logged OUT)",
-      candidates: ['a[href*="/customer/account/login"]', 'a:has-text("Log In")'],
-      required: false,
-    },
-    3_000
-  ).then((r) => r !== null);
+  // Give the header (account menu / login link) a moment to render — the nav is
+  // JS-rendered and the visibility checks below are instantaneous.
+  await page
+    .locator(
+      [
+        ...SELECTORS.login.loggedInIndicator.candidates,
+        ...SELECTORS.login.loginLink.candidates,
+      ].join(", ")
+    )
+    .first()
+    .waitFor({ state: "visible", timeout: 5_000 })
+    .catch(() => {
+      /* neither rendered — fall through to the ambiguous case below */
+    });
 
-  const loggedIn = !loginLinkVisible;
-  logger.info(MODULE, "login_state_check", { loggedIn });
+  // Positive signal: an account/avatar affordance means we ARE logged in.
+  const loggedInMarker = await resolveSelector(page, SELECTORS.login.loggedInIndicator, 2_000)
+    .then((r) => r !== null)
+    .catch(() => false);
+
+  // Negative signal: a login link/button means we are NOT.
+  const loginMarker = await resolveSelector(page, SELECTORS.login.loginLink, 2_000)
+    .then((r) => r !== null)
+    .catch(() => false);
+
+  let loggedIn: boolean;
+  if (loginMarker) {
+    // A visible login affordance is the most reliable "logged out" signal.
+    loggedIn = false;
+  } else if (loggedInMarker) {
+    loggedIn = true;
+  } else {
+    // Neither matched. Fail toward logged-out so we attempt a fresh login rather
+    // than proceeding on a possibly-dead session — the old false-positive bug,
+    // where a stale login-link selector silently reported "logged in".
+    logger.warn(MODULE, "login_state_ambiguous_assuming_logged_out", { url: page.url() });
+    loggedIn = false;
+  }
+
+  logger.info(MODULE, "login_state_check", { loggedIn, loggedInMarker, loginMarker });
   return loggedIn;
 }
 
@@ -118,11 +139,35 @@ export async function isLoggedIn(page: Page, logger: Logger): Promise<boolean> {
 // Login
 // ---------------------------------------------------------------------------
 
+/**
+ * When provided, every login step is logged, snapshotted to `snapshotDir`, and
+ * paused for `pauseMs` so the flow can be observed in a headed browser.
+ */
+export interface AuthDebugOptions {
+  snapshotDir: string;
+  pauseMs: number;
+}
+
+/** Logs a named login step and, in debug mode, snapshots the page + pauses. */
+async function authStep(
+  page: Page,
+  step: string,
+  logger: Logger,
+  debug?: AuthDebugOptions
+): Promise<void> {
+  logger.info(MODULE, "auth_step", { step });
+  if (!debug) return;
+  await captureNamedSnapshot(page, step, debug.snapshotDir, logger);
+  if (debug.pauseMs > 0) await page.waitForTimeout(debug.pauseMs);
+}
+
 export async function login(
   context: BrowserContext,
   page: Page,
   logger: Logger,
-  sessionFile: string
+  sessionFile: string,
+  loginUrl: string,
+  debug?: AuthDebugOptions
 ): Promise<void> {
   if (await isLoggedIn(page, logger)) {
     logger.info(MODULE, "already_logged_in");
@@ -131,21 +176,29 @@ export async function login(
 
   const credentials = loadCredentials();
 
-  logger.info(MODULE, "login_start");
-  await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 20_000 });
+  logger.info(MODULE, "login_start", { loginUrl });
+  await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
 
   const challenge = await detectChallenge(page, logger);
   if (challenge) throw new ChallengeDetectedError(challenge);
+
+  await authStep(page, "01-login-page", logger, debug);
 
   // Switch to email login tab if present (Lazada defaults to phone login)
   const emailTab = await resolveSelector(page, SELECTORS.login.emailLoginTab, 3_000);
   if (emailTab) {
     await page.locator(emailTab.selector).first().click();
     await page.waitForTimeout(500);
+    await authStep(page, "02-email-tab-selected", logger, debug);
   }
 
   await fillInput(page, SELECTORS.login.emailInput, credentials.email, logger);
+  logger.info(MODULE, "email_filled"); // value never logged
+  await authStep(page, "03-email-filled", logger, debug);
+
   await fillInput(page, SELECTORS.login.passwordInput, credentials.password, logger);
+  logger.info(MODULE, "password_filled"); // value never logged
+  await authStep(page, "04-password-filled", logger, debug);
 
   // Overwrite credential references immediately
   (credentials as { email: string; password: string }).password = "";
@@ -153,6 +206,7 @@ export async function login(
   await clickElement(page, SELECTORS.login.submitButton, logger);
 
   logger.info(MODULE, "login_submitted");
+  await authStep(page, "05-after-submit", logger, debug);
 
   // Wait for navigation away from the login page
   try {
@@ -168,6 +222,7 @@ export async function login(
     if (postChallenge) throw new ChallengeDetectedError(postChallenge);
 
     if (page.url().includes("/login")) {
+      await authStep(page, "06-login-stuck", logger, debug);
       throw new Error(
         "Login did not complete — still on login page. " +
         "Check your credentials or look for an OTP prompt in the browser."
@@ -176,7 +231,38 @@ export async function login(
   }
 
   logger.info(MODULE, "login_success");
+  await authStep(page, "06-post-login", logger, debug);
   await saveSession(context, sessionFile, logger);
+}
+
+/**
+ * Observable login flow for debugging authentication. Clears cookies to force a
+ * full logged-out login, runs `login` with per-step snapshots + pauses, then
+ * confirms the logged-in homepage renders. Intended for headed use via
+ * `--auth-debug`. Never logs credential values.
+ */
+export async function runAuthDebug(
+  context: BrowserContext,
+  page: Page,
+  logger: Logger,
+  sessionFile: string,
+  loginUrl: string,
+  snapshotDir: string,
+  pauseMs: number
+): Promise<boolean> {
+  logger.info(MODULE, "auth_debug_start", { loginUrl, snapshotDir, pauseMs });
+
+  // Force a clean logged-out state so the whole login is observable.
+  await context.clearCookies();
+  logger.info(MODULE, "auth_debug_cookies_cleared");
+
+  await login(context, page, logger, sessionFile, loginUrl, { snapshotDir, pauseMs });
+
+  // Confirm the homepage now renders in a logged-in state.
+  const loggedIn = await isLoggedIn(page, logger);
+  await captureNamedSnapshot(page, "07-homepage-rendered", snapshotDir, logger);
+  logger.info(MODULE, "auth_debug_complete", { loggedIn });
+  return loggedIn;
 }
 
 // ---------------------------------------------------------------------------

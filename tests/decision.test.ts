@@ -3,7 +3,16 @@ import {
   isPriceAcceptable,
   shouldProceed,
   computeBackoff,
+  computeChallengeBackoff,
+  extractProductId,
+  isRestockTransition,
+  parseWishlistStock,
+  classifyFromWishlistState,
+  matchWishlistItem,
+  normalizeTitle,
+  decodeJsonString,
   isAntiBot,
+  isChallengeUrl,
   formatOrderSummary,
 } from "../src/decision";
 import { StockCheckResult, Item, OrderSummary } from "../src/types";
@@ -154,6 +163,254 @@ describe("computeBackoff", () => {
 });
 
 // ---------------------------------------------------------------------------
+// computeChallengeBackoff
+// ---------------------------------------------------------------------------
+
+describe("computeChallengeBackoff", () => {
+  it("backs off (no give-up) on the first challenge with the base delay", () => {
+    const result = computeChallengeBackoff(1, 30_000, 300_000, 6);
+    expect(result.giveUp).toBe(false);
+    expect(result.delayMs).toBe(30_000); // 30000 * 2^0
+  });
+
+  it("grows the backoff exponentially with each consecutive challenge", () => {
+    expect(computeChallengeBackoff(2, 30_000, 300_000, 6).delayMs).toBe(60_000); // 2^1
+    expect(computeChallengeBackoff(3, 30_000, 300_000, 6).delayMs).toBe(120_000); // 2^2
+  });
+
+  it("caps the backoff at maxDelayMs", () => {
+    const result = computeChallengeBackoff(5, 30_000, 300_000, 10);
+    expect(result.delayMs).toBe(300_000); // 30000 * 2^4 = 480000 → capped
+  });
+
+  it("trips the circuit breaker once the limit is reached", () => {
+    const result = computeChallengeBackoff(6, 30_000, 300_000, 6);
+    expect(result.giveUp).toBe(true);
+    expect(result.delayMs).toBe(0);
+  });
+
+  it("keeps surviving while below the limit", () => {
+    expect(computeChallengeBackoff(5, 30_000, 300_000, 6).giveUp).toBe(false);
+  });
+
+  it("includes a reason string", () => {
+    const result = computeChallengeBackoff(1, 30_000, 300_000, 6);
+    expect(typeof result.reason).toBe("string");
+    expect(result.reason.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractProductId
+// ---------------------------------------------------------------------------
+
+describe("extractProductId", () => {
+  it("extracts the id from a standard PDP url", () => {
+    expect(extractProductId("https://www.lazada.sg/products/foo-i12345678.html")).toBe("12345678");
+  });
+
+  it("ignores query strings and fragments", () => {
+    expect(
+      extractProductId("https://www.lazada.sg/products/foo-i987.html?spm=a2o42.x&from=wishlist")
+    ).toBe("987");
+  });
+
+  it("is case-insensitive on the -i marker", () => {
+    expect(extractProductId("https://www.lazada.sg/products/foo-I555.html")).toBe("555");
+  });
+
+  it("extracts the id from the id-first + SKU url shape", () => {
+    expect(extractProductId("https://www.lazada.sg/products/i13696744288-s124594658123.html")).toBe(
+      "13696744288"
+    );
+  });
+
+  it("handles the id-first shape with a trailing query string", () => {
+    expect(extractProductId("https://www.lazada.sg/products/i13696744288-s124594658123.html?")).toBe(
+      "13696744288"
+    );
+  });
+
+  it("returns null when there is no id segment", () => {
+    expect(extractProductId("https://www.lazada.sg/shop/pokemon")).toBeNull();
+    expect(extractProductId("https://www.lazada.sg/products/foo.html")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isRestockTransition
+// ---------------------------------------------------------------------------
+
+describe("isRestockTransition", () => {
+  it("fires on out_of_stock → in_stock", () => {
+    expect(isRestockTransition("out_of_stock", "in_stock")).toBe(true);
+  });
+
+  it("fires on first-ever in_stock (prev undefined)", () => {
+    expect(isRestockTransition(undefined, "in_stock")).toBe(true);
+  });
+
+  it("does not fire when already in_stock", () => {
+    expect(isRestockTransition("in_stock", "in_stock")).toBe(false);
+  });
+
+  it("does not fire on non-in_stock next states", () => {
+    expect(isRestockTransition("in_stock", "out_of_stock")).toBe(false);
+    expect(isRestockTransition("out_of_stock", "unknown")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseWishlistStock / classifyFromWishlistState
+// ---------------------------------------------------------------------------
+
+describe("parseWishlistStock", () => {
+  // Mirrors Lazada's embedded shape: lightItemDetailDTO = all items,
+  // outOfStock = the OOS subset. Title contains brackets to exercise the
+  // string-aware array scanner ("[Limit 10 per person]").
+  const html = `
+    <script>window.data={"lightItemDetailDTO":[
+      {"itemId":13638671361,"itemTitle":"Deck Case 9426143","skuList":[{"skuId":1}]},
+      {"itemId":13718919969,"itemTitle":"Chaos Rising [Limit 10 per person]","skuList":[{"skuId":2}]}
+    ],"outOfStock":[
+      {"itemId":13718919969,"itemTitle":"Chaos Rising [Limit 10 per person]"}
+    ]}</script>`;
+
+  it("collects every item id into knownIds", () => {
+    const state = parseWishlistStock(html);
+    expect(state.knownIds.has("13638671361")).toBe(true);
+    expect(state.knownIds.has("13718919969")).toBe(true);
+    expect(state.knownIds.size).toBe(2);
+  });
+
+  it("collects only the out-of-stock subset into outOfStockIds", () => {
+    const state = parseWishlistStock(html);
+    expect(state.outOfStockIds.has("13718919969")).toBe(true);
+    expect(state.outOfStockIds.has("13638671361")).toBe(false);
+  });
+
+  it("is not confused by brackets inside string values", () => {
+    // If the scanner ignored strings it would stop at the "[" in the title and
+    // miss the second item.
+    expect(parseWishlistStock(html).knownIds.size).toBe(2);
+  });
+
+  it("returns empty sets when the payload markers are absent", () => {
+    const state = parseWishlistStock("<html><body>nothing here</body></html>");
+    expect(state.knownIds.size).toBe(0);
+    expect(state.outOfStockIds.size).toBe(0);
+  });
+
+  it("classifies items against the parsed state", () => {
+    const state = parseWishlistStock(html);
+    expect(classifyFromWishlistState("13638671361", state)).toBe("in_stock");
+    expect(classifyFromWishlistState("13718919969", state)).toBe("out_of_stock");
+    expect(classifyFromWishlistState("99999999999", state)).toBe("unknown");
+  });
+
+  it("exposes every item with its title and stock flag", () => {
+    const state = parseWishlistStock(html);
+    expect(state.items).toHaveLength(2);
+    const byId = new Map(state.items.map((w) => [w.itemId, w]));
+    expect(byId.get("13638671361")).toMatchObject({
+      title: "Deck Case 9426143",
+      outOfStock: false,
+    });
+    expect(byId.get("13718919969")).toMatchObject({
+      title: "Chaos Rising [Limit 10 per person]",
+      outOfStock: true,
+    });
+  });
+
+  it("decodes unicode-escaped titles", () => {
+    const escaped = `
+      <script>window.data={"lightItemDetailDTO":[
+        {"itemId":111,"itemTitle":"Pok\\u00e9mon Center\\u00a0SG \\u0026 Friends"}
+      ],"outOfStock":[]}</script>`;
+    const state = parseWishlistStock(escaped);
+    expect(state.items[0]!.title).toBe("Pokémon Center SG & Friends");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// decodeJsonString / normalizeTitle / matchWishlistItem
+// ---------------------------------------------------------------------------
+
+describe("decodeJsonString", () => {
+  it("decodes unicode and quote escapes", () => {
+    expect(decodeJsonString('Pok\\u00e9mon \\"SG\\"')).toBe('Pokémon "SG"');
+  });
+
+  it("returns the input unchanged when it is not a valid JSON string body", () => {
+    expect(decodeJsonString('broken " escape \\')).toBe('broken " escape \\');
+  });
+});
+
+describe("normalizeTitle", () => {
+  it("lowercases, strips punctuation, and collapses whitespace", () => {
+    expect(normalizeTitle("  Pokemon Center SG:  Deck-Shield [9426136]! ")).toBe(
+      "pokemon center sg deck shield 9426136"
+    );
+  });
+});
+
+describe("matchWishlistItem", () => {
+  const state = parseWishlistStock(`
+    <script>window.data={"lightItemDetailDTO":[
+      {"itemId":13638671361,"itemTitle":"Pokemon Center SG: Deck Case 9426143"},
+      {"itemId":13638593891,"itemTitle":"Pokemon Center SG: Deck Shield 9426136 [Limit 10]"},
+      {"itemId":13718919969,"itemTitle":"Chaos Rising Booster Box"}
+    ],"outOfStock":[
+      {"itemId":13638593891,"itemTitle":"Pokemon Center SG: Deck Shield 9426136 [Limit 10]"}
+    ]}</script>`);
+
+  it("matches by exact normalized title first", () => {
+    const match = matchWishlistItem(
+      { name: "pokemon center sg: deck case 9426143!", url: "https://www.lazada.sg/products/x-i99999999.html" },
+      state
+    );
+    // Title wins even though the URL id (99999999) is not on the wishlist.
+    expect(match).toMatchObject({ itemId: "13638671361", status: "in_stock", matchedBy: "title" });
+  });
+
+  it("matches when the config name is contained in exactly one wishlist title", () => {
+    const match = matchWishlistItem(
+      { name: "Deck Shield 9426136", url: "https://www.lazada.sg/products/x-i99999999.html" },
+      state
+    );
+    expect(match).toMatchObject({
+      itemId: "13638593891",
+      status: "out_of_stock",
+      matchedBy: "title_substring",
+    });
+  });
+
+  it("does not substring-match when the name is contained in multiple titles", () => {
+    const ambiguous = matchWishlistItem(
+      { name: "Pokemon Center SG", url: "https://www.lazada.sg/products/x-i99999999.html" },
+      state
+    );
+    expect(ambiguous).toBeNull();
+  });
+
+  it("falls back to the URL product id when no title matches", () => {
+    const match = matchWishlistItem(
+      { name: "My Own Label", url: "https://www.lazada.sg/products/x-i13718919969.html" },
+      state
+    );
+    expect(match).toMatchObject({ itemId: "13718919969", status: "in_stock", matchedBy: "id" });
+  });
+
+  it("returns null when neither title nor id matches", () => {
+    const match = matchWishlistItem(
+      { name: "Not On Wishlist", url: "https://www.lazada.sg/products/x-i99999999.html" },
+      state
+    );
+    expect(match).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // isAntiBot
 // ---------------------------------------------------------------------------
 
@@ -167,6 +424,42 @@ describe("isAntiBot", () => {
     for (const status of nonBotStatuses) {
       expect(isAntiBot(status)).toBe(false);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isChallengeUrl
+// ---------------------------------------------------------------------------
+
+describe("isChallengeUrl", () => {
+  it("detects the Alibaba x5sec punish redirect seen on a live run", () => {
+    expect(
+      isChallengeUrl(
+        "https://my.lazada.sg//wishlist/index/_____tmd_____/punish?x5secdata=xfiGsPw0PML3z&x5step=1"
+      )
+    ).toBe(true);
+  });
+
+  it.each([
+    ["tmd marker", "https://www.lazada.sg/foo/_____tmd_____/whatever"],
+    ["punish path", "https://www.lazada.sg/punish?x=1"],
+    ["x5secdata param", "https://www.lazada.sg/page?x5secdata=abc"],
+    ["baxia", "https://www.lazada.sg/baxia/punishpage"],
+    ["captcha", "https://www.lazada.sg/captcha/verify"],
+    ["cloudflare", "https://www.lazada.sg/cdn-cgi/challenge-platform/h"],
+    ["aws waf", "https://www.lazada.sg/awswaf/verify"],
+    ["sec path", "https://www.lazada.sg/sec/verify"],
+  ])("detects %s URLs", (_label, url) => {
+    expect(isChallengeUrl(url)).toBe(true);
+  });
+
+  it.each([
+    ["a PDP", "https://www.lazada.sg/products/pikachu-plush-i12345678.html"],
+    ["the wishlist", "https://my.lazada.sg/wishlist/index"],
+    ["the checkout host", "https://checkout.lazada.sg/"],
+    ["the login page", "https://member.lazada.sg/user/login"],
+  ])("does not flag %s", (_label, url) => {
+    expect(isChallengeUrl(url)).toBe(false);
   });
 });
 

@@ -68,6 +68,30 @@ export const SELECTORS = {
       ],
       required: true,
     } satisfies SelectorSet,
+
+    loginLink: {
+      description: "Login affordance in the site header — visible = logged OUT",
+      candidates: [
+        '#anonLogin',                 // Lazada header: logged-out "login" link container
+        '#anonLogin a',
+        '#anonSignup',
+        'a[data-spm-click*="locaid=login"]',
+        'a[href*="member.lazada"][href*="login"]',
+      ],
+      required: false,
+    } satisfies SelectorSet,
+
+    loggedInIndicator: {
+      description: "Account affordance in the header — visible = logged IN (positive signal)",
+      candidates: [
+        '#myAccountTrigger',                          // account-name trigger, shown only when logged in
+        '#topActionUserAccont:not(.top-links-item-hidden)',
+        'a[href*="member.lazada.sg/user/account"]',
+        'a[href*="member.lazada.sg/user/logout"]',
+        '[data-spm-click*="locaid=account"]',
+      ],
+      required: false,
+    } satisfies SelectorSet,
   },
 
   // ---- Anti-bot / challenge indicators ------------------------------------
@@ -124,8 +148,11 @@ export const SELECTORS = {
       description: "Buy Now button — takes directly to checkout",
       candidates: [
         'button[data-spm-click*="buynow"]',
-        // class*="buy-now" removed: Lazada's wishlist button shares this class substring
+        // class*="buy-now" alone removed: Lazada's wishlist button shares this
+        // class substring. The :has-text guard below makes it safe as a
+        // non-<button> CTA fallback.
         'button:has-text("Buy Now")',
+        '[class*="buy-now"]:has-text("Buy Now")',
       ],
       required: false,
     } satisfies SelectorSet,
@@ -159,6 +186,10 @@ export const SELECTORS = {
     } satisfies SelectorSet,
   },
 
+  // NOTE: wishlist stock state is NOT scraped from the DOM. The watcher parses
+  // the JSON Lazada embeds in the served wishlist HTML (lightItemDetailDTO /
+  // outOfStock arrays) via decision.parseWishlistStock — no selectors needed.
+
   // ---- Cart page -----------------------------------------------------------
   cart: {
     proceedToCheckout: {
@@ -189,9 +220,37 @@ export const SELECTORS = {
     paymentMethodOption: {
       description: "Individual payment method option row",
       candidates: [
+        // Live Lazada SG (2026-06): each method is a div.card-container inside
+        // .payment-card-list ("PayNow Transfer" / "************<card>" cards).
+        'div.card-container',
         '[class*="payment-option"]',
         '[class*="payment-method-item"]',
         '[class*="payment-item"]',
+        '[class*="pay-method"]',
+        '[class*="payment"] [class*="method"]',
+        'label:has(input[type="radio"])',
+      ],
+      required: false,
+    } satisfies SelectorSet,
+
+    // Used to VERIFY the selected method, never to click. checkout.ts checks the
+    // matched element's text for "paynow" — fail-closed: Place Order is never
+    // clicked unless one of these confirms PayNow (dev-phase guardrail against
+    // charging a saved card).
+    paymentSelectedIndicator: {
+      description: "Element marking the currently selected payment method",
+      candidates: [
+        // Live Lazada SG (2026-06): the chosen card is .card-container.selected.
+        'div.card-container.selected',
+        '[class*="card-container"][class*="selected"]',
+        '[class*="payment"][class*="selected"]',
+        '[class*="payment"][class*="active"]',
+        '[class*="payment"][class*="checked"]',
+        'label:has(input[type="radio"]:checked)',
+        '[aria-checked="true"]',
+        '[class*="payment-option"][class*="selected"] [class*="title"]',
+        '[class*="payment-method"][aria-selected="true"]',
+        '[class*="selected-payment"] [class*="label"]',
       ],
       required: false,
     } satisfies SelectorSet,
@@ -209,7 +268,13 @@ export const SELECTORS = {
     placeOrderButton: {
       description: "Final Place Order / Confirm Order button",
       candidates: [
+        'button:has-text("Place Order Now")',
         'button:has-text("Place Order")',
+        // Live Lazada SG (2026-06): the CTA is a styled <div>, not a <button>.
+        // :text() matches the SMALLEST element containing the text (unlike
+        // :has-text(), which would also match every ancestor div).
+        'div:text("Place Order Now")',
+        'div:text("Place Order")',
         'button:has-text("Confirm Order")',
         'button[class*="place-order"]',
         'button[class*="submit-order"]',
@@ -242,6 +307,23 @@ export const SELECTORS = {
       required: false,
     } satisfies SelectorSet,
 
+    // With PayNow, Place Order leads to a QR/payment page, not a "Thank you"
+    // order page — this page IS the success outcome (the user scans to pay).
+    // QR-specific markers only: a plain [class*="paynow"] would match the
+    // checkout page's own PayNow row and report success before navigation.
+    paymentPending: {
+      description: "PayNow QR / payment-pending page shown after Place Order",
+      candidates: [
+        '[class*="qrcode" i]',
+        '[class*="qr-code" i]',
+        '[class*="paynow-qr" i]',
+        'img[src*="qr" i]',
+        'img[alt*="qr" i]',
+        'canvas[class*="qr" i]',
+      ],
+      required: false,
+    } satisfies SelectorSet,
+
     orderNumber: {
       description: "Order ID / reference number on the confirmation page",
       candidates: [
@@ -268,29 +350,73 @@ export class SelectorNotFoundError extends Error {
   }
 }
 
-/**
- * Returns the first candidate selector that is visible on the page.
- * For required selectors, throws SelectorNotFoundError if none match.
- * For optional selectors, returns null.
- */
-export async function resolveSelector(
+/** One instant pass over the candidates: first currently-visible one wins. */
+async function firstVisibleCandidate(
   page: Page,
-  selectorSet: SelectorSet,
-  timeoutMs = 3000
+  selectorSet: SelectorSet
 ): Promise<ResolvedSelector | null> {
   for (let i = 0; i < selectorSet.candidates.length; i++) {
     const candidate = selectorSet.candidates[i]!; // safe: i is within bounds (loop invariant)
     try {
-      const visible = await page
-        .locator(candidate)
-        .first()
-        .isVisible({ timeout: timeoutMs });
+      const visible = await page.locator(candidate).first().isVisible();
       if (visible) {
         return { selector: candidate, candidateIndex: i };
       }
     } catch {
-      // Selector timed out or threw — try next candidate
+      // Selector threw (e.g. page navigating) — try next candidate
     }
+  }
+  return null;
+}
+
+/**
+ * Returns the first candidate selector that is visible on the page RIGHT NOW.
+ * For required selectors, throws SelectorNotFoundError if none match.
+ * For optional selectors, returns null.
+ *
+ * WARNING: this does NOT wait. Playwright's `isVisible` returns the current
+ * state immediately (its timeout option is deprecated and ignored), so
+ * `timeoutMs` has no effect on visibility. On Lazada's client-rendered pages
+ * the buy box / checkout CTAs hydrate hundreds of ms after domcontentloaded —
+ * use `waitForSelectorSet` whenever the element may still be rendering.
+ */
+export async function resolveSelector(
+  page: Page,
+  selectorSet: SelectorSet,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  timeoutMs = 3000
+): Promise<ResolvedSelector | null> {
+  const resolved = await firstVisibleCandidate(page, selectorSet);
+  if (resolved) return resolved;
+
+  if (selectorSet.required) {
+    throw new SelectorNotFoundError(selectorSet.description, selectorSet.candidates);
+  }
+  return null;
+}
+
+/**
+ * Waiting counterpart to resolveSelector: re-checks the candidates every
+ * `pollMs` until one becomes visible or `timeoutMs` elapses. Returns as soon
+ * as a candidate is visible (no fixed wait), so a fast-rendering page costs a
+ * single pass. At the deadline: throws SelectorNotFoundError for required
+ * sets, returns null otherwise.
+ */
+export async function waitForSelectorSet(
+  page: Page,
+  selectorSet: SelectorSet,
+  timeoutMs: number,
+  pollMs = 150
+): Promise<ResolvedSelector | null> {
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    const resolved = await firstVisibleCandidate(page, selectorSet);
+    if (resolved) return resolved;
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.min(pollMs, remaining)));
   }
 
   if (selectorSet.required) {

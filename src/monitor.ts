@@ -10,11 +10,12 @@
 
 import * as path from "path";
 import { Page } from "playwright";
-import { Item, StockCheckResult } from "./types";
+import { Item, StockCheckResult, ChallengeSurvivalOptions } from "./types";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
 import { SELECTORS } from "./selectors";
 import { resolveSelector } from "./selectors";
+import { computeChallengeBackoff } from "./decision";
 import { detectChallenge } from "./auth";
 import { navigateTo } from "./browser-actions";
 import { captureDomSnapshot, describeProductSelectors } from "./diagnostics";
@@ -31,6 +32,7 @@ export async function checkStock(
   item: Item,
   rateLimiter: RateLimiter,
   logger: Logger,
+  settleMs: number,
   debugDir?: string
 ): Promise<StockCheckResult> {
   const timestamp = new Date().toISOString();
@@ -53,8 +55,12 @@ export async function checkStock(
     return { ...base, status: "unknown", price: null, pageTitle: null };
   }
 
-  // Brief pause for dynamic JS content to settle
-  await page.waitForTimeout(1_500);
+  // Adaptive settle: proceed as soon as the price anchor renders (or any
+  // product anchor), capped at settleMs. This replaces a blind fixed wait so a
+  // fast-rendering page is evaluated in a few hundred ms instead of always
+  // burning the full settle — the difference that lets the poll cadence sit
+  // under the ~3s restock window.
+  await waitForProductReady(page, settleMs);
 
   const pageTitle = await page.title().catch(() => null);
 
@@ -104,13 +110,17 @@ export async function waitForStock(
   rateLimiter: RateLimiter,
   logger: Logger,
   signal: AbortSignal,
+  survival: ChallengeSurvivalOptions,
+  settleMs: number,
   debugSnapshots = false,
   debugDir?: string
 ): Promise<StockCheckResult> {
   logger.info(MODULE, "monitoring_started", {
     item: item.name,
     intervalMs,
+    settleMs,
     maxPrice: item.maxPrice,
+    surviveChallenges: survival.surviveChallenges,
   });
 
   // Resolve debug dir once — derived from the caller-supplied path or cwd
@@ -118,18 +128,54 @@ export async function waitForStock(
     ? (debugDir ?? path.join(process.cwd(), "data", "debug"))
     : undefined;
 
+  // Tracks the current run of back-to-back challenges; reset by any good check.
+  let consecutiveChallenges = 0;
+
   while (!signal.aborted) {
-    const result = await checkStock(page, item, rateLimiter, logger, resolvedDebugDir);
+    const result = await checkStock(page, item, rateLimiter, logger, settleMs, resolvedDebugDir);
 
     if (result.status === "anti_bot") {
-      logger.error(MODULE, "monitoring_halted_anti_bot", { item: item.name });
-      return result; // caller inspects status and handles accordingly
+      // Fail-closed (legacy) behaviour: hand control back to the caller.
+      if (!survival.surviveChallenges) {
+        logger.error(MODULE, "monitoring_halted_anti_bot", { item: item.name });
+        return result;
+      }
+
+      // Survival mode: back off and resume so a single challenge does not end
+      // the 2-hour watch. A circuit breaker stops an endless hammering loop.
+      consecutiveChallenges++;
+      const backoff = computeChallengeBackoff(
+        consecutiveChallenges,
+        survival.challengeBackoffBaseMs,
+        survival.challengeBackoffMaxMs,
+        survival.maxConsecutiveChallenges
+      );
+
+      if (backoff.giveUp) {
+        logger.error(MODULE, "monitoring_halted_anti_bot_circuit_breaker", {
+          item: item.name,
+          consecutiveChallenges,
+          reason: backoff.reason,
+        });
+        return result;
+      }
+
+      logger.warn(MODULE, "anti_bot_backoff_resume", {
+        item: item.name,
+        consecutiveChallenges,
+        backoffMs: backoff.delayMs,
+      });
+      await interruptibleSleep(backoff.delayMs, signal);
+      continue;
     }
 
     if (result.status === "login_required") {
       logger.error(MODULE, "monitoring_halted_login_expired", { item: item.name });
       return result;
     }
+
+    // A clean check ends any challenge streak.
+    consecutiveChallenges = 0;
 
     if (result.status === "in_stock") {
       logger.info(MODULE, "item_available", { item: item.name, price: result.price });
@@ -160,6 +206,25 @@ export async function waitForStock(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Waits until the product page has rendered enough to evaluate, bounded by
+ * `settleMs`. Returns as soon as the price anchor becomes visible; falls
+ * through (no throw) on timeout so `determineStatus` still runs on whatever
+ * did render. `settleMs <= 0` skips waiting entirely (fastest, riskiest).
+ */
+async function waitForProductReady(page: Page, settleMs: number): Promise<void> {
+  if (settleMs <= 0) return;
+  // price candidates are plain CSS — safe to union into one locator.
+  const anchor = SELECTORS.product.price.candidates.join(", ");
+  await page
+    .locator(anchor)
+    .first()
+    .waitFor({ state: "visible", timeout: settleMs })
+    .catch(() => {
+      /* not rendered within settleMs — proceed and let determineStatus decide */
+    });
+}
 
 async function extractPrice(
   page: Page,
@@ -231,7 +296,7 @@ async function determineStatus(
   return "unknown";
 }
 
-async function interruptibleSleep(ms: number, signal: AbortSignal): Promise<void> {
+export async function interruptibleSleep(ms: number, signal: AbortSignal): Promise<void> {
   const step = 500;
   let elapsed = 0;
   while (elapsed < ms && !signal.aborted) {

@@ -9,6 +9,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { Config, Item, ProxySettings, Settings } from "./types";
+import { extractProductId } from "./decision";
 
 // ---------------------------------------------------------------------------
 // Credential access (env-vars only)
@@ -110,9 +111,14 @@ export function loadTelegramCredentials(): TelegramCredentials {
 const DEFAULT_DATA_DIR = "data";
 
 const DEFAULTS: Settings = {
-  checkIntervalMs: 15_000,
-  minPageLoadDelayMs: 3_000,
-  maxPageLoadDelayMs: 8_000,
+  // Aggressive by default: this tool exists to win a sub-3s restock window, so
+  // it polls fast and paces loosely. Dry-run (also default) is the safety net;
+  // stealth + challenge survival absorb the higher detection risk. Raise these
+  // for a calmer, lower-risk watch.
+  checkIntervalMs: 2_000,
+  pollSettleMs: 1_500,
+  minPageLoadDelayMs: 800,
+  maxPageLoadDelayMs: 1_800,
   headless: false,
   maxRetries: 3,
   retryBackoffBaseMs: 2_000,
@@ -125,6 +131,19 @@ const DEFAULTS: Settings = {
   approvalMethod: "stdin", // Safe default — terminal-based approval
   healthPort: 0,      // 0 = disabled; set to a port between 1024–65535 to enable
   debugSnapshots: false, // Enable with --debug-dom CLI flag or set true in config
+  stealth: true,      // Mask automation fingerprints to reduce anti-bot challenges
+  fastCheckout: true, // Buy on the live in-stock page — no re-navigation, no rate-limit wait
+  surviveChallenges: true, // Back off and resume monitoring on a challenge instead of halting
+  challengeBackoffBaseMs: 30_000,  // First challenge backoff (grows exponentially)
+  challengeBackoffMaxMs: 300_000,  // Cap challenge backoff at 5 minutes
+  maxConsecutiveChallenges: 6,     // Give up after 6 challenges with no good check between
+  monitorMode: "per-item",         // Safe default — unchanged behaviour; opt into "wishlist"
+  loginUrl: "https://member.lazada.sg/user/login", // Lazada's current login page (old /customer/account/login 404s)
+  wishlistUrl: "https://my.lazada.sg/wishlist/index",
+  wishlistPollIntervalMs: 2_000,   // One watcher poll regardless of item count
+  buyMaxRetries: 5,                // Fast OOS retries on the buy path (traffic vs sellout)
+  buyRetryBaseMs: 400,             // Sub-second backoff so retries fit the drop window
+  buyRetryMaxMs: 2_000,
   workerStartDelayMs: 0,  // 0 = no stagger; set to e.g. 5000 to stagger worker startup
   blockHeavyAssets: true, // Abort image/media/font requests to cut proxy bandwidth + speed polls
 };
@@ -234,11 +253,14 @@ function validateSettings(raw: Record<string, unknown>): Settings {
     ...raw,
   } as Settings;
 
-  if (merged.checkIntervalMs < 5_000) {
-    throw new ConfigValidationError("settings.checkIntervalMs must be >= 5000ms to avoid rate-limiting");
+  if (merged.checkIntervalMs < 1_000) {
+    throw new ConfigValidationError("settings.checkIntervalMs must be >= 1000ms");
   }
-  if (merged.minPageLoadDelayMs < 1_000) {
-    throw new ConfigValidationError("settings.minPageLoadDelayMs must be >= 1000ms");
+  if (typeof merged.pollSettleMs !== "number" || merged.pollSettleMs < 0) {
+    throw new ConfigValidationError("settings.pollSettleMs must be a number >= 0");
+  }
+  if (merged.minPageLoadDelayMs < 250) {
+    throw new ConfigValidationError("settings.minPageLoadDelayMs must be >= 250ms");
   }
   if (merged.maxPageLoadDelayMs < merged.minPageLoadDelayMs) {
     throw new ConfigValidationError(
@@ -273,6 +295,49 @@ function validateSettings(raw: Record<string, unknown>): Settings {
   const proxy = validateProxy(raw["proxy"]);
   if (proxy) merged.proxy = proxy;
   else delete merged.proxy;
+  if (typeof merged.stealth !== "boolean") {
+    throw new ConfigValidationError("settings.stealth must be a boolean");
+  }
+  if (typeof merged.fastCheckout !== "boolean") {
+    throw new ConfigValidationError("settings.fastCheckout must be a boolean");
+  }
+  if (typeof merged.surviveChallenges !== "boolean") {
+    throw new ConfigValidationError("settings.surviveChallenges must be a boolean");
+  }
+  if (merged.challengeBackoffBaseMs < 1_000) {
+    throw new ConfigValidationError("settings.challengeBackoffBaseMs must be >= 1000ms");
+  }
+  if (merged.challengeBackoffMaxMs < merged.challengeBackoffBaseMs) {
+    throw new ConfigValidationError(
+      "settings.challengeBackoffMaxMs must be >= challengeBackoffBaseMs"
+    );
+  }
+  if (!Number.isInteger(merged.maxConsecutiveChallenges) || merged.maxConsecutiveChallenges < 1) {
+    throw new ConfigValidationError(
+      "settings.maxConsecutiveChallenges must be an integer >= 1"
+    );
+  }
+  if (merged.monitorMode !== "wishlist" && merged.monitorMode !== "per-item") {
+    throw new ConfigValidationError('settings.monitorMode must be "wishlist" or "per-item"');
+  }
+  if (typeof merged.loginUrl !== "string" || !merged.loginUrl.startsWith("https://")) {
+    throw new ConfigValidationError("settings.loginUrl must be a string starting with https://");
+  }
+  if (typeof merged.wishlistUrl !== "string" || !merged.wishlistUrl.startsWith("https://")) {
+    throw new ConfigValidationError("settings.wishlistUrl must be a string starting with https://");
+  }
+  if (merged.wishlistPollIntervalMs < 1_000) {
+    throw new ConfigValidationError("settings.wishlistPollIntervalMs must be >= 1000ms");
+  }
+  if (!Number.isInteger(merged.buyMaxRetries) || merged.buyMaxRetries < 1 || merged.buyMaxRetries > 10) {
+    throw new ConfigValidationError("settings.buyMaxRetries must be an integer between 1 and 10");
+  }
+  if (merged.buyRetryBaseMs < 100) {
+    throw new ConfigValidationError("settings.buyRetryBaseMs must be >= 100ms");
+  }
+  if (merged.buyRetryMaxMs < merged.buyRetryBaseMs) {
+    throw new ConfigValidationError("settings.buyRetryMaxMs must be >= buyRetryBaseMs");
+  }
   if (
     typeof merged.workerStartDelayMs !== "number" ||
     !Number.isFinite(merged.workerStartDelayMs) ||
@@ -339,6 +404,20 @@ export function loadConfig(configPath?: string): Config {
       ? (obj["settings"] as Record<string, unknown>)
       : {}
   );
+
+  // In wishlist mode the watcher matches cards to items by product id extracted
+  // from the URL — an item whose URL has no id could never be matched (and would
+  // silently never buy), so fail fast.
+  if (settings.monitorMode === "wishlist") {
+    items.forEach((item, i) => {
+      if (extractProductId(item.url) === null) {
+        throw new ConfigValidationError(
+          `items[${i}].url has no extractable product id (expected "...-i<digits>.html"), ` +
+          "required for monitorMode \"wishlist\""
+        );
+      }
+    });
+  }
 
   return { items, settings };
 }
