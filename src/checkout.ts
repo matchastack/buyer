@@ -20,7 +20,7 @@ import { Page } from "playwright";
 import { Item, Config, CheckoutResult, RetryProfile } from "./types";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
-import { SELECTORS, resolveSelector, waitForSelectorSet } from "./selectors";
+import { SELECTORS, resolveSelector, waitForSelectorSet, SelectorNotFoundError } from "./selectors";
 import { detectChallenge, ChallengeDetectedError } from "./auth";
 import { navigateTo, clickElement, extractText } from "./browser-actions";
 import { captureNamedSnapshot, describeProductSelectors } from "./diagnostics";
@@ -131,6 +131,7 @@ async function attemptCheckout(
   skipInitialNav: boolean
 ): Promise<CheckoutResult> {
   const timer = new PhaseTimer();
+  const debugDir = path.join(config.settings.dataDir, "debug");
   try {
     // Fast path: the page is already on the in-stock product page (just seen by
     // the monitor). Skip the rate-limit wait and re-navigation — every second
@@ -156,7 +157,7 @@ async function attemptCheckout(
     );
     timer.mark("locate_buy_now");
     if (!buyNow) {
-      logger.warn(MODULE, "buy_now_unavailable", { item: item.name, attempt });
+      logger.warn(MODULE, "buy_now_unavailable", { item: item.name, attempt, url: page.url() });
       logger.info(MODULE, "checkout_timing", {
         item: item.name,
         attempt,
@@ -175,14 +176,13 @@ async function attemptCheckout(
     logger.info(MODULE, "clicked_buy_now", { item: item.name, attempt });
 
     // Element gate: we are "on the checkout page" when the Place Order CTA is
-    // visible (required set: throws on timeout, failing this attempt into the
-    // retry loop). No URL assumption — see CHECKOUT_READY_WAIT_MS note.
-    await waitForSelectorSet(page, SELECTORS.checkout.placeOrderButton, CHECKOUT_READY_WAIT_MS);
+    // visible. No URL assumption — see CHECKOUT_READY_WAIT_MS note. Challenge-
+    // aware: an anti-bot punish redirect here throws immediately instead of
+    // burning the full wait (the live x5sec punish hit exactly this window).
+    await waitForCheckoutReady(page, logger);
     timer.mark("buy_now_to_checkout");
 
     logger.info(MODULE, "on_checkout_page", { item: item.name, url: page.url() });
-
-    const debugDir = path.join(config.settings.dataDir, "debug");
 
     const payNowConfirmed = await ensurePayNowSelected(page, logger);
     timer.mark("select_payment");
@@ -216,12 +216,22 @@ async function attemptCheckout(
         item: item.name,
         attempt,
         type: err.challenge.type,
+        url: err.challenge.url,
       });
+      await captureNamedSnapshot(page, `checkout-challenge-${item.name}`, debugDir, logger);
       throw err; // Propagate — caller (index.ts) initiates shutdown
     }
 
+    // Always-on per-attempt snapshot: the terminal snapshot only preserves the
+    // LAST attempt's page, but the first attempt is usually the informative one.
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error(MODULE, "checkout_attempt_failed", { item: item.name, attempt, error: errMsg });
+    logger.error(MODULE, "checkout_attempt_failed", {
+      item: item.name,
+      attempt,
+      url: page.url(),
+      error: errMsg,
+    });
+    await captureNamedSnapshot(page, `checkout-failed-${item.name}-attempt${attempt}`, debugDir, logger);
     return { success: false, orderNumber: null, error: errMsg };
   }
 }
@@ -240,6 +250,32 @@ async function setQuantity(page: Page, quantity: number, logger: Logger): Promis
   await locator.click({ clickCount: 3 });
   await locator.fill(String(quantity));
   logger.debug(MODULE, "quantity_set", { quantity });
+}
+
+/**
+ * Waits (bounded) for the Buy Now → checkout navigation to land: ready when the
+ * Place Order CTA is visible. Each pass also runs detectChallenge so an
+ * anti-bot redirect (punish/captcha) throws ChallengeDetectedError immediately
+ * — without this, a punished session looks like a selector timeout and the
+ * retry loop re-clicks Buy Now into the same flagged session.
+ */
+async function waitForCheckoutReady(page: Page, logger: Logger): Promise<void> {
+  const set = SELECTORS.checkout.placeOrderButton;
+  const deadline = Date.now() + CHECKOUT_READY_WAIT_MS;
+
+  do {
+    const resolved = await resolveSelector(page, set).catch(() => null);
+    if (resolved) return;
+
+    const challenge = await detectChallenge(page, logger);
+    if (challenge) throw new ChallengeDetectedError(challenge);
+
+    await page.waitForTimeout(250);
+  } while (Date.now() < deadline);
+
+  // Same error waitForSelectorSet throws for a required set, so the retry
+  // loop and logs are unchanged.
+  throw new SelectorNotFoundError(set.description, set.candidates);
 }
 
 /**
@@ -355,6 +391,11 @@ async function waitForConfirmation(
       await captureNamedSnapshot(page, `order-confirmed-${itemName}`, debugDir, logger);
       return { success: true, orderNumber: null, error: null };
     }
+
+    // A punish/captcha redirect can equally follow Place Order — surface it
+    // immediately instead of timing out into a misleading "not detected".
+    const challenge = await detectChallenge(page, logger);
+    if (challenge) throw new ChallengeDetectedError(challenge);
 
     await page.waitForTimeout(250);
   } while (Date.now() < deadline);

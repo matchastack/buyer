@@ -91,6 +91,27 @@ export function isAntiBot(status: StockStatus): boolean {
   return status === "anti_bot";
 }
 
+/**
+ * True when a URL is a known Lazada/Alibaba bot-challenge page. Pure so the
+ * pattern list is unit-testable; auth.detectChallenge is the runtime caller.
+ * `_____tmd_____`/`punish`/`x5secdata` are the Alibaba x5sec punish redirect
+ * (seen live: my.lazada.sg//wishlist/index/_____tmd_____/punish?x5secdata=…).
+ */
+export function isChallengeUrl(url: string): boolean {
+  return (
+    url.includes("/baxia/") ||
+    url.includes("/block") ||
+    url.includes("/robot") ||
+    url.includes("captcha") ||
+    url.includes("/cdn-cgi/challenge-platform/") ||
+    url.includes("/awswaf/") ||
+    url.includes("/sec/") ||
+    url.includes("_____tmd_____") ||
+    url.includes("/punish") ||
+    url.includes("x5secdata")
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Product-id extraction & restock transition (wishlist mode)
 // ---------------------------------------------------------------------------

@@ -142,7 +142,8 @@ export async function watchWishlist(
   signal: AbortSignal,
   survival: ChallengeSurvivalOptions,
   onClassified: (c: WishlistClassification) => void,
-  debugDir?: string
+  debugDir?: string,
+  isPaused?: () => boolean
 ): Promise<void> {
   logger.info(MODULE, "watch_started", {
     wishlistUrl,
@@ -156,7 +157,24 @@ export async function watchWishlist(
   const matchAnnounced = new Set<string>();
   let consecutiveChallenges = 0;
 
+  let pauseAnnounced = false;
   while (!signal.aborted) {
+    // A buy in flight is the session's peak request rate — skip wishlist polls
+    // until it finishes (fired gates are latched; a concurrent restock for
+    // another item is only detected late, not lost).
+    if (isPaused?.()) {
+      if (!pauseAnnounced) {
+        pauseAnnounced = true;
+        logger.info(MODULE, "watch_paused_for_buy");
+      }
+      await interruptibleSleep(500, signal);
+      continue;
+    }
+    if (pauseAnnounced) {
+      pauseAnnounced = false;
+      logger.info(MODULE, "watch_resumed_after_buy");
+    }
+
     const result = await checkWishlist(page, items, wishlistUrl, rateLimiter, logger, debugDir);
 
     if (result.kind === "anti_bot") {

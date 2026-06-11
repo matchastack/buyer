@@ -12,6 +12,7 @@ import {
   normalizeTitle,
   decodeJsonString,
   isAntiBot,
+  isChallengeUrl,
   formatOrderSummary,
 } from "../src/decision";
 import { StockCheckResult, Item, OrderSummary } from "../src/types";
@@ -423,6 +424,42 @@ describe("isAntiBot", () => {
     for (const status of nonBotStatuses) {
       expect(isAntiBot(status)).toBe(false);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isChallengeUrl
+// ---------------------------------------------------------------------------
+
+describe("isChallengeUrl", () => {
+  it("detects the Alibaba x5sec punish redirect seen on a live run", () => {
+    expect(
+      isChallengeUrl(
+        "https://my.lazada.sg//wishlist/index/_____tmd_____/punish?x5secdata=xfiGsPw0PML3z&x5step=1"
+      )
+    ).toBe(true);
+  });
+
+  it.each([
+    ["tmd marker", "https://www.lazada.sg/foo/_____tmd_____/whatever"],
+    ["punish path", "https://www.lazada.sg/punish?x=1"],
+    ["x5secdata param", "https://www.lazada.sg/page?x5secdata=abc"],
+    ["baxia", "https://www.lazada.sg/baxia/punishpage"],
+    ["captcha", "https://www.lazada.sg/captcha/verify"],
+    ["cloudflare", "https://www.lazada.sg/cdn-cgi/challenge-platform/h"],
+    ["aws waf", "https://www.lazada.sg/awswaf/verify"],
+    ["sec path", "https://www.lazada.sg/sec/verify"],
+  ])("detects %s URLs", (_label, url) => {
+    expect(isChallengeUrl(url)).toBe(true);
+  });
+
+  it.each([
+    ["a PDP", "https://www.lazada.sg/products/pikachu-plush-i12345678.html"],
+    ["the wishlist", "https://my.lazada.sg/wishlist/index"],
+    ["the checkout host", "https://checkout.lazada.sg/"],
+    ["the login page", "https://member.lazada.sg/user/login"],
+  ])("does not flag %s", (_label, url) => {
+    expect(isChallengeUrl(url)).toBe(false);
   });
 });
 

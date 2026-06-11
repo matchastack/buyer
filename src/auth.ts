@@ -11,6 +11,7 @@ import { BrowserContext, Page } from "playwright";
 import * as fs from "fs";
 import { Logger } from "./logger";
 import { loadCredentials } from "./config";
+import { isChallengeUrl } from "./decision";
 import { SELECTORS } from "./selectors";
 import { resolveSelector } from "./selectors";
 import { fillInput, clickElement, waitForUrl } from "./browser-actions";
@@ -49,16 +50,9 @@ export async function detectChallenge(
 ): Promise<Challenge | null> {
   const url = page.url();
 
-  // URL-based detection (Lazada/Alibaba bot-challenge pages use known paths)
-  if (
-    url.includes("/baxia/") ||
-    url.includes("/block") ||
-    url.includes("/robot") ||
-    url.includes("captcha") ||
-    url.includes("/cdn-cgi/challenge-platform/") ||
-    url.includes("/awswaf/") ||
-    url.includes("/sec/")
-  ) {
+  // URL-based detection (Lazada/Alibaba bot-challenge pages use known paths —
+  // pattern list lives in decision.isChallengeUrl so it is unit-testable)
+  if (isChallengeUrl(url)) {
     const challenge: Challenge = { type: "captcha", url, detectedAt: new Date().toISOString() };
     logger.warn(MODULE, "challenge_detected_url", { url, type: challenge.type });
     return challenge;

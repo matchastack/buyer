@@ -171,7 +171,8 @@ async function runBuyerWorker(
   gate: RestockGate,
   signal: AbortSignal,
   itemStatus: ItemStatus,
-  runtimeStatus: RuntimeStatus
+  runtimeStatus: RuntimeStatus,
+  activeBuys: { count: number }
 ): Promise<void> {
   const fastRetry: RetryProfile = {
     maxRetries: config.settings.buyMaxRetries,
@@ -189,6 +190,10 @@ async function runBuyerWorker(
     itemStatus.lastChecked = new Date().toISOString();
     runtimeStatus.totalCheckoutAttempts++;
 
+    // While any buy is in flight the watcher pauses its wishlist polling —
+    // the buy itself is the session's peak request rate, and stacking the
+    // 1-2s wishlist reloads on top is what primes anti-bot punishment.
+    activeBuys.count++;
     try {
       // Warm reload: a page held open for hours won't auto-enable Buy Now, but
       // the reload skips the rate limiter and reuses the warm session. The first
@@ -224,6 +229,8 @@ async function runBuyerWorker(
         throw err; // fail-closed on the buy path
       }
       logger.error("buyer", "buy_error", { item: item.name, error: (err as Error).message });
+    } finally {
+      activeBuys.count--;
     }
   }
 }
@@ -557,6 +564,10 @@ async function main(): Promise<void> {
     };
 
     const registry = new RestockRegistry();
+    // Shared buy-in-flight counter: buyers increment around a buy, the watcher
+    // skips wishlist polls while it is non-zero (lower anti-bot footprint at
+    // the most sensitive moment). Fired gates stay latched, so nothing is lost.
+    const activeBuys = { count: 0 };
     // Non-null: loadConfig guarantees every URL yields an id in wishlist mode.
     const productIds = config.items.map((it) => extractProductId(it.url)!);
     const gates = productIds.map((id) => registry.register(id));
@@ -582,7 +593,8 @@ async function main(): Promise<void> {
           s.checkCount++;
         }
       },
-      debugDir
+      debugDir,
+      () => activeBuys.count > 0
     ).finally(() => {
       // Watcher death (login_required / circuit breaker) blinds all buyers, so
       // halt the run: abort wakes idle buyers, which then exit.
@@ -601,7 +613,8 @@ async function main(): Promise<void> {
         gates[i]!,
         controller.signal,
         itemStatuses[i]!,
-        runtimeStatus
+        runtimeStatus,
+        activeBuys
       )
     );
 
