@@ -3,10 +3,13 @@
  *
  * Flow per attempt:
  *   1. Navigate to product page → click Buy Now (no Add to Cart fallback)
- *   2. Wait for checkout page
- *   3. Select PayNow
- *   4. Click Place Order
- *   5. Wait for confirmation (Lazada sends a PayNow QR — user scans to complete payment)
+ *   2. Wait for the checkout page's Place Order CTA (element gate — no URL
+ *      assumption; Lazada SG checkout is a separate HOST, not a /checkout path)
+ *   3. Confirm PayNow is the selected method — fail-closed: if unconfirmable,
+ *      abort WITHOUT placing the order (guardrail against a saved card charge)
+ *   4. Click Place Order Now
+ *   5. Wait for the outcome: classic order-success page OR the PayNow QR /
+ *      cashier page (the scan-to-pay handoff — counts as success; user pays)
  *
  * Anti-bot challenges halt checkout immediately.
  * Dry-run guard is the FIRST check — aborts before any page navigation.
@@ -19,7 +22,7 @@ import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
 import { SELECTORS, resolveSelector, waitForSelectorSet } from "./selectors";
 import { detectChallenge, ChallengeDetectedError } from "./auth";
-import { navigateTo, clickElement, extractText, waitForUrl } from "./browser-actions";
+import { navigateTo, clickElement, extractText } from "./browser-actions";
 import { captureNamedSnapshot, describeProductSelectors } from "./diagnostics";
 import { PhaseTimer } from "./timing";
 
@@ -32,9 +35,21 @@ const PAYMENT_METHOD = "paynow";
 // bounded waits for each stage (waitForSelectorSet returns the moment the
 // element appears, so a fast render costs a single pass).
 const BUY_NOW_WAIT_MS = 3_000;
-const CHECKOUT_READY_WAIT_MS = 10_000;
-const PAYMENT_OPTIONS_WAIT_MS = 5_000;
+// Absorbs the Buy Now → checkout navigation too: arrival on the checkout page
+// is detected by the Place Order CTA appearing, NOT by URL (Lazada SG checkout
+// lives on the checkout.lazada.sg HOST with pathname "/", and its load event
+// may never fire — a path-based waitForURL gate timed out on a live run).
+const CHECKOUT_READY_WAIT_MS = 15_000;
+const PAYMENT_OPTIONS_WAIT_MS = 8_000;
 const CONFIRMATION_WAIT_MS = 20_000;
+
+// Fail-closed guardrail (dev phase): the checkout page offers a saved card next
+// to PayNow, so Place Order is NEVER clicked unless PayNow is positively
+// confirmed as the selected method. This sentinel marks that abort; the retry
+// loop treats it as non-retryable (re-running cannot fix a selector mismatch
+// and would stack abandoned checkouts).
+const PAYNOW_NOT_CONFIRMED_ERROR =
+  "PayNow could not be confirmed as the selected payment method — order NOT placed";
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -72,6 +87,10 @@ export async function checkout(
     const result = await attemptCheckout(page, item, config, rateLimiter, logger, attempt, skipInitialNav);
 
     if (result.success) return result;
+
+    // Fail-closed: PayNow unconfirmed is non-retryable (its own forensic
+    // snapshot was already captured in ensurePayNowSelected's failure path).
+    if (result.error === PAYNOW_NOT_CONFIRMED_ERROR) return result;
 
     if (attempt < profile.maxRetries) {
       const backoffMs = Math.min(
@@ -155,29 +174,34 @@ async function attemptCheckout(
     await clickElement(page, SELECTORS.product.buyNowButton, logger);
     logger.info(MODULE, "clicked_buy_now", { item: item.name, attempt });
 
-    await waitForUrl(
-      page,
-      (url) => url.pathname.includes("/checkout"),
-      15_000,
-      logger
-    );
+    // Element gate: we are "on the checkout page" when the Place Order CTA is
+    // visible (required set: throws on timeout, failing this attempt into the
+    // retry loop). No URL assumption — see CHECKOUT_READY_WAIT_MS note.
+    await waitForSelectorSet(page, SELECTORS.checkout.placeOrderButton, CHECKOUT_READY_WAIT_MS);
     timer.mark("buy_now_to_checkout");
 
-    logger.info(MODULE, "on_checkout_page", { item: item.name });
+    logger.info(MODULE, "on_checkout_page", { item: item.name, url: page.url() });
 
-    // The checkout page is also client-rendered — wait for the Place Order
-    // CTA before touching payment options (required set: throws on timeout,
-    // which fails this attempt into the retry loop).
-    await waitForSelectorSet(page, SELECTORS.checkout.placeOrderButton, CHECKOUT_READY_WAIT_MS);
+    const debugDir = path.join(config.settings.dataDir, "debug");
 
-    await selectPaymentMethod(page, logger);
+    const payNowConfirmed = await ensurePayNowSelected(page, logger);
     timer.mark("select_payment");
+    if (!payNowConfirmed) {
+      logger.error(MODULE, "paynow_not_confirmed", {
+        item: item.name,
+        attempt,
+        url: page.url(),
+      });
+      await captureNamedSnapshot(page, `paynow-not-confirmed-${item.name}`, debugDir, logger);
+      return { success: false, orderNumber: null, error: PAYNOW_NOT_CONFIRMED_ERROR };
+    }
 
     // Place order — Lazada will display a PayNow QR for the user to scan
+    const urlAtPlaceOrder = page.url();
     await clickElement(page, SELECTORS.checkout.placeOrderButton, logger);
     logger.info(MODULE, "place_order_clicked", { item: item.name });
 
-    const result = await waitForConfirmation(page, item.name, logger);
+    const result = await waitForConfirmation(page, item.name, logger, urlAtPlaceOrder, debugDir);
     timer.mark("place_order_to_confirm");
     logger.info(MODULE, "checkout_timing", {
       item: item.name,
@@ -218,12 +242,49 @@ async function setQuantity(page: Page, quantity: number, logger: Logger): Promis
   logger.debug(MODULE, "quantity_set", { quantity });
 }
 
-async function selectPaymentMethod(page: Page, logger: Logger): Promise<void> {
-  // Payment options render progressively, so a single pass can run before the
-  // PayNow row exists — re-scan until the deadline.
+/**
+ * Reads the currently selected payment method via the indicator selector set
+ * and returns true iff its text names PayNow. Multiple indicator strategies
+ * (selected/active/checked classes, aria, :checked radios) so one DOM shape
+ * change doesn't blind the check.
+ */
+async function isPayNowConfirmed(page: Page): Promise<boolean> {
+  for (const candidate of SELECTORS.checkout.paymentSelectedIndicator.candidates) {
+    const matches = page.locator(candidate);
+    const count = await matches.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const el = matches.nth(i);
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) continue;
+      const text = ((await el.textContent().catch(() => "")) ?? "").toLowerCase();
+      if (text.includes(PAYMENT_METHOD)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Ensures PayNow is the selected payment method: confirms via the selected
+ * indicator first (PayNow is often pre-selected), otherwise finds and clicks
+ * the PayNow row and re-checks. Returns false at the deadline — the caller
+ * then ABORTS without placing the order (fail-closed guardrail).
+ */
+async function ensurePayNowSelected(page: Page, logger: Logger): Promise<boolean> {
   const deadline = Date.now() + PAYMENT_OPTIONS_WAIT_MS;
+  let clicked = false;
 
   do {
+    // Already selected? (covers Lazada pre-selecting PayNow — the common case)
+    if (await isPayNowConfirmed(page)) {
+      logger.info(MODULE, "payment_method_selected", {
+        paymentMethod: PAYMENT_METHOD,
+        clicked,
+      });
+      return true;
+    }
+
+    // Find a PayNow row among the option candidates and click it. Options
+    // render progressively, so keep re-scanning until the deadline.
     for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
       const options = page.locator(candidate);
       const count = await options.count().catch(() => 0);
@@ -233,43 +294,75 @@ async function selectPaymentMethod(page: Page, logger: Logger): Promise<void> {
         const option = options.nth(i);
         const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
 
-        if (text.includes("paynow")) {
+        if (text.includes(PAYMENT_METHOD)) {
           await option.click().catch(() => {});
-          logger.info(MODULE, "payment_method_selected", { paymentMethod: PAYMENT_METHOD });
-          await page.waitForTimeout(1_000);
-          return;
+          clicked = true;
+          logger.debug(MODULE, "paynow_row_clicked", { candidate });
+          break;
         }
       }
-      break; // found option rows with this candidate but no PayNow among them (yet)
+      if (clicked) break; // re-check the indicator before trying other candidates
     }
-    await page.waitForTimeout(200);
+
+    await page.waitForTimeout(250);
   } while (Date.now() < deadline);
 
-  logger.warn(MODULE, "paynow_option_not_found");
+  return false;
 }
 
+/**
+ * Polls (bounded) for the outcome of Place Order. Two success shapes:
+ *  - classic "Thank you" order page (successHeading) — extract the order number;
+ *  - the PayNow QR / cashier page (paymentPending markers, or a navigation to a
+ *    cashier/pay URL) — this is the scan-to-pay handoff and counts as success
+ *    with no order number. The checkout job is complete at this point; the QR
+ *    stays on screen for the user.
+ * Either way an always-on snapshot is saved as the audit/QR record.
+ */
 async function waitForConfirmation(
   page: Page,
   itemName: string,
-  logger: Logger
+  logger: Logger,
+  urlAtPlaceOrder: string,
+  debugDir: string
 ): Promise<CheckoutResult> {
-  // Genuinely waits (resolveSelector never did) — the confirmation page takes
-  // seconds to load and render after Place Order.
-  const resolved = await waitForSelectorSet(
-    page,
-    SELECTORS.confirmation.successHeading,
-    CONFIRMATION_WAIT_MS
-  ).catch(() => null);
+  const deadline = Date.now() + CONFIRMATION_WAIT_MS;
 
-  if (resolved !== null) {
-    const orderNumberText = await extractText(page, SELECTORS.confirmation.orderNumber, logger);
-    const orderNumber = orderNumberText?.trim().replace(/[^A-Za-z0-9-]/g, "") ?? null;
+  do {
+    const heading = await resolveSelector(page, SELECTORS.confirmation.successHeading).catch(
+      () => null
+    );
+    if (heading) {
+      const orderNumberText = await extractText(page, SELECTORS.confirmation.orderNumber, logger);
+      const orderNumber = orderNumberText?.trim().replace(/[^A-Za-z0-9-]/g, "") ?? null;
 
-    logger.info(MODULE, "order_confirmed", { item: itemName, orderNumber });
-    return { success: true, orderNumber, error: null };
-  }
+      logger.info(MODULE, "order_confirmed", { item: itemName, orderNumber });
+      await captureNamedSnapshot(page, `order-confirmed-${itemName}`, debugDir, logger);
+      return { success: true, orderNumber, error: null };
+    }
 
-  if (page.url().includes("/checkout")) {
+    const qr = await resolveSelector(page, SELECTORS.confirmation.paymentPending).catch(
+      () => null
+    );
+    const url = page.url();
+    const movedToCashier = url !== urlAtPlaceOrder && /cashier|pay/i.test(url);
+    if (qr || movedToCashier) {
+      logger.info(MODULE, "paynow_qr_displayed", {
+        item: itemName,
+        url,
+        marker: qr?.selector ?? "url",
+      });
+      await captureNamedSnapshot(page, `order-confirmed-${itemName}`, debugDir, logger);
+      return { success: true, orderNumber: null, error: null };
+    }
+
+    await page.waitForTimeout(250);
+  } while (Date.now() < deadline);
+
+  // Deadline reached with neither success shape — scan once for an explicit
+  // failure banner (only now: words like "error" are too generic to gate the
+  // poll loop on while the QR may still be loading).
+  if (page.url() === urlAtPlaceOrder) {
     const bodyText = (await page.locator("body").textContent().catch(() => "")) ?? "";
     if (
       bodyText.toLowerCase().includes("failed") ||

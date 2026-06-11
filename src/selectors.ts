@@ -223,6 +223,28 @@ export const SELECTORS = {
         '[class*="payment-option"]',
         '[class*="payment-method-item"]',
         '[class*="payment-item"]',
+        '[class*="pay-method"]',
+        '[class*="payment"] [class*="method"]',
+        'label:has(input[type="radio"])',
+      ],
+      required: false,
+    } satisfies SelectorSet,
+
+    // Used to VERIFY the selected method, never to click. checkout.ts checks the
+    // matched element's text for "paynow" — fail-closed: Place Order is never
+    // clicked unless one of these confirms PayNow (dev-phase guardrail against
+    // charging a saved card).
+    paymentSelectedIndicator: {
+      description: "Element marking the currently selected payment method",
+      candidates: [
+        '[class*="payment"][class*="selected"]',
+        '[class*="payment"][class*="active"]',
+        '[class*="payment"][class*="checked"]',
+        'label:has(input[type="radio"]:checked)',
+        '[aria-checked="true"]',
+        '[class*="payment-option"][class*="selected"] [class*="title"]',
+        '[class*="payment-method"][aria-selected="true"]',
+        '[class*="selected-payment"] [class*="label"]',
       ],
       required: false,
     } satisfies SelectorSet,
@@ -240,6 +262,7 @@ export const SELECTORS = {
     placeOrderButton: {
       description: "Final Place Order / Confirm Order button",
       candidates: [
+        'button:has-text("Place Order Now")',
         'button:has-text("Place Order")',
         'button:has-text("Confirm Order")',
         'button[class*="place-order"]',
@@ -269,6 +292,23 @@ export const SELECTORS = {
         'h2:has-text("Thank You")',
         'h1:has-text("Order Placed")',
         '[class*="success-title"]',
+      ],
+      required: false,
+    } satisfies SelectorSet,
+
+    // With PayNow, Place Order leads to a QR/payment page, not a "Thank you"
+    // order page — this page IS the success outcome (the user scans to pay).
+    // QR-specific markers only: a plain [class*="paynow"] would match the
+    // checkout page's own PayNow row and report success before navigation.
+    paymentPending: {
+      description: "PayNow QR / payment-pending page shown after Place Order",
+      candidates: [
+        '[class*="qrcode" i]',
+        '[class*="qr-code" i]',
+        '[class*="paynow-qr" i]',
+        'img[src*="qr" i]',
+        'img[alt*="qr" i]',
+        'canvas[class*="qr" i]',
       ],
       required: false,
     } satisfies SelectorSet,
