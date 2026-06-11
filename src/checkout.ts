@@ -307,10 +307,13 @@ async function isPayNowConfirmed(page: Page): Promise<boolean> {
  */
 async function ensurePayNowSelected(page: Page, logger: Logger): Promise<boolean> {
   const deadline = Date.now() + PAYMENT_OPTIONS_WAIT_MS;
+  let lastClickAt = 0;
   let clicked = false;
 
   do {
-    // Already selected? (covers Lazada pre-selecting PayNow — the common case)
+    // Already selected? (live page pre-selects the saved CARD, not PayNow —
+    // so the click below is the expected path, and this check is the proof
+    // the click landed.)
     if (await isPayNowConfirmed(page)) {
       logger.info(MODULE, "payment_method_selected", {
         paymentMethod: PAYMENT_METHOD,
@@ -320,24 +323,27 @@ async function ensurePayNowSelected(page: Page, logger: Logger): Promise<boolean
     }
 
     // Find a PayNow row among the option candidates and click it. Options
-    // render progressively, so keep re-scanning until the deadline.
-    for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
-      const options = page.locator(candidate);
-      const count = await options.count().catch(() => 0);
-      if (count === 0) continue;
+    // render progressively, so keep re-scanning until the deadline — but click
+    // at most once per second: the card needs a re-render beat to flip to
+    // selected, and hammering it risks toggling the cashier widget.
+    if (Date.now() - lastClickAt >= 1_000) {
+      candidateScan: for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
+        const options = page.locator(candidate);
+        const count = await options.count().catch(() => 0);
 
-      for (let i = 0; i < count; i++) {
-        const option = options.nth(i);
-        const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
+        for (let i = 0; i < count; i++) {
+          const option = options.nth(i);
+          const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
 
-        if (text.includes(PAYMENT_METHOD)) {
-          await option.click().catch(() => {});
-          clicked = true;
-          logger.debug(MODULE, "paynow_row_clicked", { candidate });
-          break;
+          if (text.includes(PAYMENT_METHOD)) {
+            await option.click().catch(() => {});
+            lastClickAt = Date.now();
+            clicked = true;
+            logger.debug(MODULE, "paynow_row_clicked", { candidate });
+            break candidateScan; // re-check the indicator before clicking again
+          }
         }
       }
-      if (clicked) break; // re-check the indicator before trying other candidates
     }
 
     await page.waitForTimeout(250);

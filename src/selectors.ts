@@ -220,6 +220,9 @@ export const SELECTORS = {
     paymentMethodOption: {
       description: "Individual payment method option row",
       candidates: [
+        // Live Lazada SG (2026-06): each method is a div.card-container inside
+        // .payment-card-list ("PayNow Transfer" / "************<card>" cards).
+        'div.card-container',
         '[class*="payment-option"]',
         '[class*="payment-method-item"]',
         '[class*="payment-item"]',
@@ -237,6 +240,9 @@ export const SELECTORS = {
     paymentSelectedIndicator: {
       description: "Element marking the currently selected payment method",
       candidates: [
+        // Live Lazada SG (2026-06): the chosen card is .card-container.selected.
+        'div.card-container.selected',
+        '[class*="card-container"][class*="selected"]',
         '[class*="payment"][class*="selected"]',
         '[class*="payment"][class*="active"]',
         '[class*="payment"][class*="checked"]',
@@ -264,6 +270,11 @@ export const SELECTORS = {
       candidates: [
         'button:has-text("Place Order Now")',
         'button:has-text("Place Order")',
+        // Live Lazada SG (2026-06): the CTA is a styled <div>, not a <button>.
+        // :text() matches the SMALLEST element containing the text (unlike
+        // :has-text(), which would also match every ancestor div).
+        'div:text("Place Order Now")',
+        'div:text("Place Order")',
         'button:has-text("Confirm Order")',
         'button[class*="place-order"]',
         'button[class*="submit-order"]',
