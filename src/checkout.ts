@@ -12,18 +12,29 @@
  * Dry-run guard is the FIRST check — aborts before any page navigation.
  */
 
+import * as path from "path";
 import { Page } from "playwright";
 import { Item, Config, CheckoutResult, RetryProfile } from "./types";
 import { Logger } from "./logger";
 import { RateLimiter } from "./rate-limiter";
-import { SELECTORS, resolveSelector } from "./selectors";
+import { SELECTORS, resolveSelector, waitForSelectorSet } from "./selectors";
 import { detectChallenge, ChallengeDetectedError } from "./auth";
-import { navigateTo, clickElement, isVisible, extractText, waitForUrl } from "./browser-actions";
+import { navigateTo, clickElement, extractText, waitForUrl } from "./browser-actions";
+import { captureNamedSnapshot, describeProductSelectors } from "./diagnostics";
 import { PhaseTimer } from "./timing";
 
 const MODULE = "checkout";
 const LAZADA_DOMAIN = "www.lazada.sg";
 const PAYMENT_METHOD = "paynow";
+
+// Lazada pages are client-rendered: navigateTo returns at domcontentloaded but
+// the buy box / checkout CTAs hydrate hundreds of ms later. These are the
+// bounded waits for each stage (waitForSelectorSet returns the moment the
+// element appears, so a fast render costs a single pass).
+const BUY_NOW_WAIT_MS = 3_000;
+const CHECKOUT_READY_WAIT_MS = 10_000;
+const PAYMENT_OPTIONS_WAIT_MS = 5_000;
+const CONFIRMATION_WAIT_MS = 20_000;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -72,6 +83,14 @@ export async function checkout(
     }
   }
 
+  // Terminal failure: capture the page exactly as the last attempt saw it
+  // (screenshot + HTML + per-selector match report). This is the only moment
+  // the evidence exists, so it is always on — not gated by debugSnapshots.
+  const failureDir = path.join(config.settings.dataDir, "debug");
+  logger.warn(MODULE, "capturing_failure_snapshot", { item: item.name, dir: failureDir });
+  await captureNamedSnapshot(page, `checkout-failed-${item.name}`, failureDir, logger);
+  await describeProductSelectors(page, logger);
+
   return {
     success: false,
     orderNumber: null,
@@ -108,14 +127,16 @@ async function attemptCheckout(
     const challenge = await detectChallenge(page, logger);
     if (challenge) throw new ChallengeDetectedError(challenge);
 
-    if (item.quantity > 1) {
-      await setQuantity(page, item.quantity, logger);
-    }
-
-    // Buy Now only — no Add to Cart fallback
-    const buyNowVisible = await isVisible(page, SELECTORS.product.buyNowButton, logger, 3_000);
+    // Buy Now only — no Add to Cart fallback. The buy box hydrates after
+    // domcontentloaded, so this WAITS (bounded) for a candidate to appear
+    // instead of sampling the instant page state.
+    const buyNow = await waitForSelectorSet(
+      page,
+      SELECTORS.product.buyNowButton,
+      BUY_NOW_WAIT_MS
+    );
     timer.mark("locate_buy_now");
-    if (!buyNowVisible) {
+    if (!buyNow) {
       logger.warn(MODULE, "buy_now_unavailable", { item: item.name, attempt });
       logger.info(MODULE, "checkout_timing", {
         item: item.name,
@@ -124,6 +145,11 @@ async function attemptCheckout(
         ...timer.summary(),
       });
       return { success: false, orderNumber: null, error: "Buy Now button not found" };
+    }
+
+    // Quantity after the buy box is up — the input hydrates with it.
+    if (item.quantity > 1) {
+      await setQuantity(page, item.quantity, logger);
     }
 
     await clickElement(page, SELECTORS.product.buyNowButton, logger);
@@ -138,6 +164,11 @@ async function attemptCheckout(
     timer.mark("buy_now_to_checkout");
 
     logger.info(MODULE, "on_checkout_page", { item: item.name });
+
+    // The checkout page is also client-rendered — wait for the Place Order
+    // CTA before touching payment options (required set: throws on timeout,
+    // which fails this attempt into the retry loop).
+    await waitForSelectorSet(page, SELECTORS.checkout.placeOrderButton, CHECKOUT_READY_WAIT_MS);
 
     await selectPaymentMethod(page, logger);
     timer.mark("select_payment");
@@ -188,24 +219,31 @@ async function setQuantity(page: Page, quantity: number, logger: Logger): Promis
 }
 
 async function selectPaymentMethod(page: Page, logger: Logger): Promise<void> {
-  for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
-    const options = page.locator(candidate);
-    const count = await options.count().catch(() => 0);
-    if (count === 0) continue;
+  // Payment options render progressively, so a single pass can run before the
+  // PayNow row exists — re-scan until the deadline.
+  const deadline = Date.now() + PAYMENT_OPTIONS_WAIT_MS;
 
-    for (let i = 0; i < count; i++) {
-      const option = options.nth(i);
-      const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
+  do {
+    for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
+      const options = page.locator(candidate);
+      const count = await options.count().catch(() => 0);
+      if (count === 0) continue;
 
-      if (text.includes("paynow")) {
-        await option.click().catch(() => {});
-        logger.info(MODULE, "payment_method_selected", { paymentMethod: PAYMENT_METHOD });
-        await page.waitForTimeout(1_000);
-        return;
+      for (let i = 0; i < count; i++) {
+        const option = options.nth(i);
+        const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
+
+        if (text.includes("paynow")) {
+          await option.click().catch(() => {});
+          logger.info(MODULE, "payment_method_selected", { paymentMethod: PAYMENT_METHOD });
+          await page.waitForTimeout(1_000);
+          return;
+        }
       }
+      break; // found option rows with this candidate but no PayNow among them (yet)
     }
-    break; // found elements with this candidate but no PayNow match
-  }
+    await page.waitForTimeout(200);
+  } while (Date.now() < deadline);
 
   logger.warn(MODULE, "paynow_option_not_found");
 }
@@ -215,9 +253,13 @@ async function waitForConfirmation(
   itemName: string,
   logger: Logger
 ): Promise<CheckoutResult> {
-  const resolved = await resolveSelector(page, SELECTORS.confirmation.successHeading, 20_000).catch(
-    () => null
-  );
+  // Genuinely waits (resolveSelector never did) — the confirmation page takes
+  // seconds to load and render after Place Order.
+  const resolved = await waitForSelectorSet(
+    page,
+    SELECTORS.confirmation.successHeading,
+    CONFIRMATION_WAIT_MS
+  ).catch(() => null);
 
   if (resolved !== null) {
     const orderNumberText = await extractText(page, SELECTORS.confirmation.orderNumber, logger);

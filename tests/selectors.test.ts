@@ -1,6 +1,7 @@
-import { vi, describe, it, expect } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   resolveSelector,
+  waitForSelectorSet,
   SelectorNotFoundError,
 } from "../src/selectors";
 import { SelectorSet } from "../src/types";
@@ -55,7 +56,7 @@ const requiredSet: SelectorSet = {
 describe("resolveSelector", () => {
   it("returns { selector, candidateIndex: 0 } when the first candidate is visible", async () => {
     const page = makeMockPage([".first-candidate"]);
-    const result = await resolveSelector(page as any, twoCandidate, 100);
+    const result = await resolveSelector(page as never, twoCandidate, 100);
     expect(result).not.toBeNull();
     expect(result!.selector).toBe(".first-candidate");
     expect(result!.candidateIndex).toBe(0);
@@ -63,7 +64,7 @@ describe("resolveSelector", () => {
 
   it("skips invisible candidates and returns the second candidate when first is not visible", async () => {
     const page = makeMockPage([".second-candidate"]);
-    const result = await resolveSelector(page as any, twoCandidate, 100);
+    const result = await resolveSelector(page as never, twoCandidate, 100);
     expect(result).not.toBeNull();
     expect(result!.selector).toBe(".second-candidate");
     expect(result!.candidateIndex).toBe(1);
@@ -71,21 +72,21 @@ describe("resolveSelector", () => {
 
   it("returns null for a non-required selector when no candidate is visible", async () => {
     const page = makeMockPage([]);
-    const result = await resolveSelector(page as any, twoCandidate, 100);
+    const result = await resolveSelector(page as never, twoCandidate, 100);
     expect(result).toBeNull();
   });
 
   it("throws SelectorNotFoundError for a required selector when no candidate is visible", async () => {
     const page = makeMockPage([]);
     await expect(
-      resolveSelector(page as any, requiredSet, 100)
+      resolveSelector(page as never, requiredSet, 100)
     ).rejects.toThrow(SelectorNotFoundError);
   });
 
   it("SelectorNotFoundError message contains the description and candidates", async () => {
     const page = makeMockPage([]);
     try {
-      await resolveSelector(page as any, requiredSet, 100);
+      await resolveSelector(page as never, requiredSet, 100);
       expect.fail("expected to throw");
     } catch (err) {
       expect(err).toBeInstanceOf(SelectorNotFoundError);
@@ -99,31 +100,33 @@ describe("resolveSelector", () => {
 
   it("resolves with candidateIndex matching whichever candidate matched (index 2)", async () => {
     const page = makeMockPage([".gamma"]);
-    const result = await resolveSelector(page as any, threeCandidate, 100);
+    const result = await resolveSelector(page as never, threeCandidate, 100);
     expect(result).not.toBeNull();
     expect(result!.selector).toBe(".gamma");
     expect(result!.candidateIndex).toBe(2);
   });
 
-  it("passes the timeoutMs option through to isVisible", async () => {
-    const calls: number[] = [];
+  it("does a single instant pass — exactly one isVisible call per candidate", async () => {
+    // Playwright's isVisible ignores its timeout option, so resolveSelector is
+    // an instant check by contract; waiting is waitForSelectorSet's job.
+    let calls = 0;
     const page = {
       locator: (_selector: string) => ({
         first: () => ({
-          isVisible: (opts?: { timeout?: number }) => {
-            calls.push(opts?.timeout ?? -1);
+          isVisible: () => {
+            calls++;
             return Promise.resolve(false);
           },
         }),
       }),
     };
     const set: SelectorSet = {
-      description: "timeout check",
+      description: "instant check",
       candidates: [".only"],
       required: false,
     };
-    await resolveSelector(page as any, set, 7777);
-    expect(calls).toEqual([7777]);
+    await resolveSelector(page as never, set, 7777);
+    expect(calls).toBe(1);
   });
 
   it("continues to next candidate when isVisible throws (transient error)", async () => {
@@ -144,9 +147,65 @@ describe("resolveSelector", () => {
       candidates: [".throws", ".visible"],
       required: false,
     };
-    const result = await resolveSelector(page as any, set, 100);
+    const result = await resolveSelector(page as never, set, 100);
     expect(result).not.toBeNull();
     expect(result!.candidateIndex).toBe(1);
     expect(result!.selector).toBe(".visible");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// waitForSelectorSet
+// ---------------------------------------------------------------------------
+
+describe("waitForSelectorSet", () => {
+  /** Page whose selector becomes visible after `visibleAfter` isVisible calls. */
+  function makeHydratingPage(selector: string, visibleAfter: number) {
+    let calls = 0;
+    return {
+      callCount: () => calls,
+      locator: (s: string) => ({
+        first: () => ({
+          isVisible: () => {
+            calls++;
+            return Promise.resolve(s === selector && calls >= visibleAfter);
+          },
+        }),
+      }),
+    };
+  }
+
+  it("returns immediately when a candidate is already visible", async () => {
+    const page = makeHydratingPage(".first-candidate", 1);
+    const start = Date.now();
+    const result = await waitForSelectorSet(page as never, twoCandidate, 1_000, 50);
+    expect(result).not.toBeNull();
+    expect(result!.selector).toBe(".first-candidate");
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  it("polls until a late-hydrating candidate becomes visible", async () => {
+    // Candidate only visible from the 3rd isVisible call — a single instant
+    // pass (resolveSelector) would miss it; the poller must catch it.
+    const page = makeHydratingPage(".first-candidate", 3);
+    const result = await waitForSelectorSet(page as never, twoCandidate, 2_000, 20);
+    expect(result).not.toBeNull();
+    expect(result!.selector).toBe(".first-candidate");
+    expect(page.callCount()).toBeGreaterThanOrEqual(3);
+  });
+
+  it("returns null at the deadline for a non-required set that never appears", async () => {
+    const page = makeMockPage([]);
+    const start = Date.now();
+    const result = await waitForSelectorSet(page as never, twoCandidate, 200, 50);
+    expect(result).toBeNull();
+    expect(Date.now() - start).toBeGreaterThanOrEqual(200);
+  });
+
+  it("throws SelectorNotFoundError at the deadline for a required set", async () => {
+    const page = makeMockPage([]);
+    await expect(
+      waitForSelectorSet(page as never, requiredSet, 150, 50)
+    ).rejects.toThrow(SelectorNotFoundError);
   });
 });

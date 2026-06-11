@@ -148,8 +148,11 @@ export const SELECTORS = {
       description: "Buy Now button — takes directly to checkout",
       candidates: [
         'button[data-spm-click*="buynow"]',
-        // class*="buy-now" removed: Lazada's wishlist button shares this class substring
+        // class*="buy-now" alone removed: Lazada's wishlist button shares this
+        // class substring. The :has-text guard below makes it safe as a
+        // non-<button> CTA fallback.
         'button:has-text("Buy Now")',
+        '[class*="buy-now"]:has-text("Buy Now")',
       ],
       required: false,
     } satisfies SelectorSet,
@@ -296,29 +299,73 @@ export class SelectorNotFoundError extends Error {
   }
 }
 
-/**
- * Returns the first candidate selector that is visible on the page.
- * For required selectors, throws SelectorNotFoundError if none match.
- * For optional selectors, returns null.
- */
-export async function resolveSelector(
+/** One instant pass over the candidates: first currently-visible one wins. */
+async function firstVisibleCandidate(
   page: Page,
-  selectorSet: SelectorSet,
-  timeoutMs = 3000
+  selectorSet: SelectorSet
 ): Promise<ResolvedSelector | null> {
   for (let i = 0; i < selectorSet.candidates.length; i++) {
     const candidate = selectorSet.candidates[i]!; // safe: i is within bounds (loop invariant)
     try {
-      const visible = await page
-        .locator(candidate)
-        .first()
-        .isVisible({ timeout: timeoutMs });
+      const visible = await page.locator(candidate).first().isVisible();
       if (visible) {
         return { selector: candidate, candidateIndex: i };
       }
     } catch {
-      // Selector timed out or threw — try next candidate
+      // Selector threw (e.g. page navigating) — try next candidate
     }
+  }
+  return null;
+}
+
+/**
+ * Returns the first candidate selector that is visible on the page RIGHT NOW.
+ * For required selectors, throws SelectorNotFoundError if none match.
+ * For optional selectors, returns null.
+ *
+ * WARNING: this does NOT wait. Playwright's `isVisible` returns the current
+ * state immediately (its timeout option is deprecated and ignored), so
+ * `timeoutMs` has no effect on visibility. On Lazada's client-rendered pages
+ * the buy box / checkout CTAs hydrate hundreds of ms after domcontentloaded —
+ * use `waitForSelectorSet` whenever the element may still be rendering.
+ */
+export async function resolveSelector(
+  page: Page,
+  selectorSet: SelectorSet,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  timeoutMs = 3000
+): Promise<ResolvedSelector | null> {
+  const resolved = await firstVisibleCandidate(page, selectorSet);
+  if (resolved) return resolved;
+
+  if (selectorSet.required) {
+    throw new SelectorNotFoundError(selectorSet.description, selectorSet.candidates);
+  }
+  return null;
+}
+
+/**
+ * Waiting counterpart to resolveSelector: re-checks the candidates every
+ * `pollMs` until one becomes visible or `timeoutMs` elapses. Returns as soon
+ * as a candidate is visible (no fixed wait), so a fast-rendering page costs a
+ * single pass. At the deadline: throws SelectorNotFoundError for required
+ * sets, returns null otherwise.
+ */
+export async function waitForSelectorSet(
+  page: Page,
+  selectorSet: SelectorSet,
+  timeoutMs: number,
+  pollMs = 150
+): Promise<ResolvedSelector | null> {
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    const resolved = await firstVisibleCandidate(page, selectorSet);
+    if (resolved) return resolved;
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.min(pollMs, remaining)));
   }
 
   if (selectorSet.required) {
