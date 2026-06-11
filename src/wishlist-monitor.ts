@@ -13,6 +13,10 @@
  * changes and needs no render settle — the data is present at domcontentloaded,
  * before the card grid hydrates.
  *
+ * Config items are matched to wishlist entries title-first (the config URL id
+ * can be non-canonical) via decision.matchWishlistItem; classifications stay
+ * keyed by the config-URL product id, which is the registry/gate key.
+ *
  * Mirrors monitor.ts: never throws on transient page errors, survives anti-bot
  * challenges by backing off and resuming (bounded by a circuit breaker), and
  * halts loudly on login_required (the watcher is a single point of failure for
@@ -30,7 +34,7 @@ import {
   extractProductId,
   isRestockTransition,
   parseWishlistStock,
-  classifyFromWishlistState,
+  matchWishlistItem,
 } from "./decision";
 import { interruptibleSleep } from "./monitor";
 import { captureNamedSnapshot } from "./diagnostics";
@@ -41,9 +45,11 @@ const LAZADA_DOMAIN = "www.lazada.sg";
 const MATCH_MISS_WARN_THRESHOLD = 5;
 
 export interface WishlistClassification {
-  productId: string;
-  status: StockStatus; // in_stock | out_of_stock | unknown
+  productId: string;    // config-URL product id — the registry/gate key
+  status: StockStatus;  // in_stock | out_of_stock | unknown
   matchedCard: boolean; // false ⇒ item not found in the wishlist data this poll
+  matchedBy: "title" | "title_substring" | "id" | null;
+  wishlistItemId: string | null; // the wishlist itemId the match resolved to
 }
 
 type WishlistResult =
@@ -58,7 +64,7 @@ type WishlistResult =
 
 export async function checkWishlist(
   page: Page,
-  trackedIds: string[],
+  items: Item[],
   wishlistUrl: string,
   rateLimiter: RateLimiter,
   logger: Logger,
@@ -101,9 +107,21 @@ export async function checkWishlist(
     logger.warn(MODULE, "no_wishlist_data_in_page", { url: page.url() });
   }
 
-  const classifications = trackedIds.map((id) => {
-    const status = classifyFromWishlistState(id, state);
-    return { productId: id, status, matchedCard: status !== "unknown" };
+  // Title-first matching (URL id as fallback), but classifications stay keyed
+  // by the config-URL product id — that is what the registry/gates use.
+  const classifications = items.map((it): WishlistClassification => {
+    const configId = extractProductId(it.url) ?? it.url;
+    const match = matchWishlistItem(it, state);
+    if (!match) {
+      return { productId: configId, status: "unknown", matchedCard: false, matchedBy: null, wishlistItemId: null };
+    }
+    return {
+      productId: configId,
+      status: match.status,
+      matchedCard: true,
+      matchedBy: match.matchedBy,
+      wishlistItemId: match.itemId,
+    };
   });
 
   return { kind: "ok", classifications };
@@ -126,23 +144,20 @@ export async function watchWishlist(
   onClassified: (c: WishlistClassification) => void,
   debugDir?: string
 ): Promise<void> {
-  const trackedIds = items
-    .map((it) => extractProductId(it.url))
-    .filter((id): id is string => id !== null);
-
   logger.info(MODULE, "watch_started", {
     wishlistUrl,
     intervalMs,
-    trackedIds,
+    tracked: items.map((it) => ({ name: it.name, productId: extractProductId(it.url) })),
     surviveChallenges: survival.surviveChallenges,
   });
 
   const lastStatus = new Map<string, StockStatus>();
   const missStreak = new Map<string, number>();
+  const matchAnnounced = new Set<string>();
   let consecutiveChallenges = 0;
 
   while (!signal.aborted) {
-    const result = await checkWishlist(page, trackedIds, wishlistUrl, rateLimiter, logger, debugDir);
+    const result = await checkWishlist(page, items, wishlistUrl, rateLimiter, logger, debugDir);
 
     if (result.kind === "anti_bot") {
       if (!survival.surviveChallenges) {
@@ -191,12 +206,20 @@ export async function watchWishlist(
           logger.warn(MODULE, "item_not_found_on_wishlist", {
             productId: c.productId,
             consecutiveMisses: streak,
-            hint: "Is the item still on the wishlist? Does its URL id match the wishlist itemId?",
+            hint: "Neither the item name matched a wishlist title nor the URL id a wishlist itemId. Run `npm run list-wishlist` to see what the wishlist actually contains, then fix the config name/url.",
           });
         }
         continue;
       }
       missStreak.set(c.productId, 0);
+      if (!matchAnnounced.has(c.productId)) {
+        matchAnnounced.add(c.productId);
+        logger.info(MODULE, "item_matched_on_wishlist", {
+          productId: c.productId,
+          wishlistItemId: c.wishlistItemId,
+          matchedBy: c.matchedBy,
+        });
+      }
 
       const prev = lastStatus.get(c.productId);
       if (isRestockTransition(prev, c.status)) {

@@ -20,7 +20,7 @@ import { loadSession, login, saveSession, isLoggedIn, runAuthDebug, ChallengeDet
 import { waitForStock } from "./monitor";
 import { watchWishlist } from "./wishlist-monitor";
 import { RestockRegistry, RestockGate } from "./restock-signal";
-import { shouldProceed, isAntiBot, extractProductId, parseWishlistStock } from "./decision";
+import { shouldProceed, isAntiBot, extractProductId, parseWishlistStock, matchWishlistItem } from "./decision";
 import { checkout } from "./checkout";
 import { navigateTo } from "./browser-actions";
 import { startHealthServer, RuntimeStatus, ItemStatus } from "./health";
@@ -34,6 +34,7 @@ import { Item, Config, StockCheckResult, ChallengeSurvivalOptions, RetryProfile 
 const args = process.argv.slice(2);
 const CLI_DRY_RUN = args.includes("--dry-run");
 const CLI_VERIFY_SELECTORS = args.includes("--verify-selectors");
+const CLI_LIST_WISHLIST = args.includes("--list-wishlist");
 const CLI_DEBUG_DOM = args.includes("--debug-dom");
 const CLI_AUTH_DEBUG = args.includes("--auth-debug");
 const AUTH_DEBUG_PAUSE_MS = 2_000;
@@ -258,18 +259,20 @@ async function verifySelectors(
     }
 
     // Wishlist mode reads embedded JSON, not DOM selectors — verify the payload
-    // parses and that each configured item is matchable by its product id.
+    // parses and that each configured item is matchable by title or product id.
     logger.info("verify", "checking_wishlist_payload", { url: config.settings.wishlistUrl });
     await page.goto(config.settings.wishlistUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
     const html = (await page.content().catch(() => "")) ?? "";
     const state = parseWishlistStock(html);
     const trackedMatches = config.items.map((it) => {
-      const id = extractProductId(it.url);
+      const match = matchWishlistItem(it, state);
       return {
         name: it.name,
-        productId: id,
-        onWishlist: id !== null && state.knownIds.has(id),
-        outOfStock: id !== null && state.outOfStockIds.has(id),
+        configUrlId: extractProductId(it.url),
+        onWishlist: match !== null,
+        matchedBy: match?.matchedBy ?? null,
+        wishlistItemId: match?.itemId ?? null,
+        status: match?.status ?? "not_found",
       };
     });
     logger.info("verify", "wishlist_payload_results", {
@@ -277,6 +280,68 @@ async function verifySelectors(
       outOfStockCount: state.outOfStockIds.size,
       trackedMatches,
     });
+  } finally {
+    await page.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wishlist listing mode
+// ---------------------------------------------------------------------------
+
+/**
+ * Read-only diagnostic (`npm run list-wishlist`): prints every item Lazada
+ * reports on the account wishlist (itemId, title, stock) plus the match result
+ * for each configured item — so a failed match can be fixed by copying the
+ * exact title/id into config.json.
+ */
+async function listWishlist(
+  context: BrowserContext,
+  config: Config,
+  logger: Logger
+): Promise<void> {
+  const page = await context.newPage();
+  try {
+    logger.info("wishlist-list", "loading_wishlist", { url: config.settings.wishlistUrl });
+    await page.goto(config.settings.wishlistUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
+    const html = (await page.content().catch(() => "")) ?? "";
+    const state = parseWishlistStock(html);
+
+    if (state.items.length === 0) {
+      logger.warn("wishlist-list", "no_wishlist_data", {
+        url: page.url(),
+        hint: "Empty wishlist, session expired (page redirected?), or Lazada changed the embedded payload shape.",
+      });
+      return;
+    }
+
+    logger.info("wishlist-list", "wishlist_items_found", { count: state.items.length });
+    for (const w of state.items) {
+      logger.info("wishlist-list", "wishlist_item", {
+        itemId: w.itemId,
+        title: w.title || "(no title in payload)",
+        stock: w.outOfStock ? "OUT_OF_STOCK" : "in_stock",
+      });
+    }
+
+    for (const it of config.items) {
+      const match = matchWishlistItem(it, state);
+      const entry = {
+        name: it.name,
+        configUrlId: extractProductId(it.url),
+        matchedBy: match?.matchedBy ?? null,
+        wishlistItemId: match?.itemId ?? null,
+        status: match?.status ?? "not_found",
+      };
+      if (match) {
+        logger.info("wishlist-list", "config_item_matched", entry);
+      } else {
+        logger.warn("wishlist-list", "config_item_not_matched", {
+          ...entry,
+          hint: "Set the item's config name to one of the wishlist titles above (or use the canonical PDP URL whose id matches a wishlist itemId).",
+        });
+      }
+    }
   } finally {
     await page.close();
   }
@@ -421,6 +486,15 @@ async function main(): Promise<void> {
     logger.info("main", "running_selector_verification");
     await verifySelectors(context, config, logger);
     await shutdown("selector_verification_complete");
+    process.exit(0);
+  }
+
+  // ── Wishlist listing mode ────────────────────────────────────────────────
+
+  if (CLI_LIST_WISHLIST) {
+    logger.info("main", "running_wishlist_listing");
+    await listWishlist(context, config, logger);
+    await shutdown("wishlist_listing_complete");
     process.exit(0);
   }
 

@@ -125,7 +125,14 @@ export function isRestockTransition(
 // Wishlist stock parsing (from Lazada's server-embedded JSON)
 // ---------------------------------------------------------------------------
 
+export interface WishlistItem {
+  itemId: string;
+  title: string;       // decoded itemTitle from the embedded JSON ("" if absent)
+  outOfStock: boolean;
+}
+
 export interface WishlistStockState {
+  items: WishlistItem[];       // every wishlist item with id + title + stock flag
   knownIds: Set<string>;       // every itemId present on the wishlist
   outOfStockIds: Set<string>;  // the subset Lazada flags out of stock
 }
@@ -166,10 +173,61 @@ function extractJsonArray(text: string, key: string): string | null {
   return null;
 }
 
-/** Collects every `"itemId":<digits>` inside an extracted array fragment. */
-function itemIdsIn(arrayFragment: string | null): string[] {
+/**
+ * Splits an extracted `[...]` fragment into its top-level `{...}` object
+ * substrings, using the same string/escape-aware scan as extractJsonArray so
+ * braces inside titles don't confuse the split.
+ */
+function splitTopLevelObjects(arrayFragment: string): string[] {
+  const objects: string[] = [];
+  let depth = 0; // 1 = directly inside the outer array
+  let start = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < arrayFragment.length; i++) {
+    const c = arrayFragment[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') {
+      inStr = true;
+    } else if (c === "{" || c === "[") {
+      if (c === "{" && depth === 1) start = i;
+      depth++;
+    } else if (c === "}" || c === "]") {
+      depth--;
+      if (c === "}" && depth === 1 && start >= 0) {
+        objects.push(arrayFragment.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return objects;
+}
+
+/**
+ * Decodes a raw JSON string body (the text between the quotes): unicode escapes
+ * (`Pokémon`), `\"`, `\\`, etc. Returns the input unchanged if it isn't a
+ * valid JSON string body.
+ */
+export function decodeJsonString(escaped: string): string {
+  try {
+    return JSON.parse(`"${escaped}"`) as string;
+  } catch {
+    return escaped;
+  }
+}
+
+/** Collects `{itemId, title}` for every object inside an extracted array fragment. */
+function itemsIn(arrayFragment: string | null): { itemId: string; title: string }[] {
   if (!arrayFragment) return [];
-  return [...arrayFragment.matchAll(/"itemId":(\d+)/g)].map((m) => m[1]!);
+  return splitTopLevelObjects(arrayFragment).flatMap((obj) => {
+    const id = obj.match(/"itemId":(\d+)/);
+    if (!id) return [];
+    const title = obj.match(/"itemTitle":"((?:[^"\\]|\\.)*)"/);
+    return [{ itemId: id[1]!, title: title ? decodeJsonString(title[1]!) : "" }];
+  });
 }
 
 /**
@@ -180,11 +238,29 @@ function itemIdsIn(arrayFragment: string | null): string[] {
  * caller treats that as "no data this poll").
  */
 export function parseWishlistStock(html: string): WishlistStockState {
-  const allIds = itemIdsIn(extractJsonArray(html, "lightItemDetailDTO"));
-  const oosIds = itemIdsIn(extractJsonArray(html, "outOfStock"));
+  const all = itemsIn(extractJsonArray(html, "lightItemDetailDTO"));
+  const oos = itemsIn(extractJsonArray(html, "outOfStock"));
+  const outOfStockIds = new Set(oos.map((e) => e.itemId));
+
+  const byId = new Map<string, WishlistItem>();
+  for (const e of [...all, ...oos]) {
+    const existing = byId.get(e.itemId);
+    if (!existing) {
+      byId.set(e.itemId, {
+        itemId: e.itemId,
+        title: e.title,
+        outOfStock: outOfStockIds.has(e.itemId),
+      });
+    } else if (!existing.title && e.title) {
+      existing.title = e.title;
+    }
+  }
+
+  const items = [...byId.values()];
   return {
-    knownIds: new Set([...allIds, ...oosIds]),
-    outOfStockIds: new Set(oosIds),
+    items,
+    knownIds: new Set(items.map((i) => i.itemId)),
+    outOfStockIds,
   };
 }
 
@@ -199,6 +275,67 @@ export function classifyFromWishlistState(
 ): StockStatus {
   if (!state.knownIds.has(productId)) return "unknown";
   return state.outOfStockIds.has(productId) ? "out_of_stock" : "in_stock";
+}
+
+// ---------------------------------------------------------------------------
+// Wishlist item matching (title first, URL id as fallback)
+// ---------------------------------------------------------------------------
+
+/** Lowercase, strip punctuation/symbols, collapse whitespace — for title comparison. */
+export function normalizeTitle(s: string): string {
+  return s
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export interface WishlistMatch {
+  itemId: string;                          // the wishlist itemId the match resolved to
+  status: Extract<StockStatus, "in_stock" | "out_of_stock">;
+  matchedBy: "title" | "title_substring" | "id";
+}
+
+/**
+ * Resolves a configured item to a wishlist entry. The config URL id can be
+ * non-canonical (share links, redirects), so the Lazada title is the primary
+ * key: (1) exact normalized-title equality with `item.name`, (2) `item.name`
+ * contained in exactly one wishlist title (unique ⇒ unambiguous), (3) the URL
+ * product id. Returns null when nothing matches — the caller treats the item
+ * as not on the wishlist.
+ */
+export function matchWishlistItem(
+  item: Pick<Item, "name" | "url">,
+  state: WishlistStockState
+): WishlistMatch | null {
+  const asMatch = (
+    w: WishlistItem,
+    matchedBy: WishlistMatch["matchedBy"]
+  ): WishlistMatch => ({
+    itemId: w.itemId,
+    status: w.outOfStock ? "out_of_stock" : "in_stock",
+    matchedBy,
+  });
+
+  const wanted = normalizeTitle(item.name);
+  if (wanted) {
+    const exact = state.items.find((w) => normalizeTitle(w.title) === wanted);
+    if (exact) return asMatch(exact, "title");
+
+    const containing = state.items.filter((w) =>
+      normalizeTitle(w.title).includes(wanted)
+    );
+    if (containing.length === 1) return asMatch(containing[0]!, "title_substring");
+  }
+
+  const id = extractProductId(item.url);
+  if (id) {
+    const byId = state.items.find((w) => w.itemId === id);
+    if (byId) return asMatch(byId, "id");
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------

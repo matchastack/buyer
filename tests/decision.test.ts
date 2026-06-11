@@ -8,6 +8,9 @@ import {
   isRestockTransition,
   parseWishlistStock,
   classifyFromWishlistState,
+  matchWishlistItem,
+  normalizeTitle,
+  decodeJsonString,
   isAntiBot,
   formatOrderSummary,
 } from "../src/decision";
@@ -302,6 +305,107 @@ describe("parseWishlistStock", () => {
     expect(classifyFromWishlistState("13638671361", state)).toBe("in_stock");
     expect(classifyFromWishlistState("13718919969", state)).toBe("out_of_stock");
     expect(classifyFromWishlistState("99999999999", state)).toBe("unknown");
+  });
+
+  it("exposes every item with its title and stock flag", () => {
+    const state = parseWishlistStock(html);
+    expect(state.items).toHaveLength(2);
+    const byId = new Map(state.items.map((w) => [w.itemId, w]));
+    expect(byId.get("13638671361")).toMatchObject({
+      title: "Deck Case 9426143",
+      outOfStock: false,
+    });
+    expect(byId.get("13718919969")).toMatchObject({
+      title: "Chaos Rising [Limit 10 per person]",
+      outOfStock: true,
+    });
+  });
+
+  it("decodes unicode-escaped titles", () => {
+    const escaped = `
+      <script>window.data={"lightItemDetailDTO":[
+        {"itemId":111,"itemTitle":"Pok\\u00e9mon Center\\u00a0SG \\u0026 Friends"}
+      ],"outOfStock":[]}</script>`;
+    const state = parseWishlistStock(escaped);
+    expect(state.items[0]!.title).toBe("Pokémon Center SG & Friends");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// decodeJsonString / normalizeTitle / matchWishlistItem
+// ---------------------------------------------------------------------------
+
+describe("decodeJsonString", () => {
+  it("decodes unicode and quote escapes", () => {
+    expect(decodeJsonString('Pok\\u00e9mon \\"SG\\"')).toBe('Pokémon "SG"');
+  });
+
+  it("returns the input unchanged when it is not a valid JSON string body", () => {
+    expect(decodeJsonString('broken " escape \\')).toBe('broken " escape \\');
+  });
+});
+
+describe("normalizeTitle", () => {
+  it("lowercases, strips punctuation, and collapses whitespace", () => {
+    expect(normalizeTitle("  Pokemon Center SG:  Deck-Shield [9426136]! ")).toBe(
+      "pokemon center sg deck shield 9426136"
+    );
+  });
+});
+
+describe("matchWishlistItem", () => {
+  const state = parseWishlistStock(`
+    <script>window.data={"lightItemDetailDTO":[
+      {"itemId":13638671361,"itemTitle":"Pokemon Center SG: Deck Case 9426143"},
+      {"itemId":13638593891,"itemTitle":"Pokemon Center SG: Deck Shield 9426136 [Limit 10]"},
+      {"itemId":13718919969,"itemTitle":"Chaos Rising Booster Box"}
+    ],"outOfStock":[
+      {"itemId":13638593891,"itemTitle":"Pokemon Center SG: Deck Shield 9426136 [Limit 10]"}
+    ]}</script>`);
+
+  it("matches by exact normalized title first", () => {
+    const match = matchWishlistItem(
+      { name: "pokemon center sg: deck case 9426143!", url: "https://www.lazada.sg/products/x-i99999999.html" },
+      state
+    );
+    // Title wins even though the URL id (99999999) is not on the wishlist.
+    expect(match).toMatchObject({ itemId: "13638671361", status: "in_stock", matchedBy: "title" });
+  });
+
+  it("matches when the config name is contained in exactly one wishlist title", () => {
+    const match = matchWishlistItem(
+      { name: "Deck Shield 9426136", url: "https://www.lazada.sg/products/x-i99999999.html" },
+      state
+    );
+    expect(match).toMatchObject({
+      itemId: "13638593891",
+      status: "out_of_stock",
+      matchedBy: "title_substring",
+    });
+  });
+
+  it("does not substring-match when the name is contained in multiple titles", () => {
+    const ambiguous = matchWishlistItem(
+      { name: "Pokemon Center SG", url: "https://www.lazada.sg/products/x-i99999999.html" },
+      state
+    );
+    expect(ambiguous).toBeNull();
+  });
+
+  it("falls back to the URL product id when no title matches", () => {
+    const match = matchWishlistItem(
+      { name: "My Own Label", url: "https://www.lazada.sg/products/x-i13718919969.html" },
+      state
+    );
+    expect(match).toMatchObject({ itemId: "13718919969", status: "in_stock", matchedBy: "id" });
+  });
+
+  it("returns null when neither title nor id matches", () => {
+    const match = matchWishlistItem(
+      { name: "Not On Wishlist", url: "https://www.lazada.sg/products/x-i99999999.html" },
+      state
+    );
+    expect(match).toBeNull();
   });
 });
 

@@ -10,6 +10,7 @@
     "dev": "ts-node src/index.ts",
     "dev:dry-run": "ts-node src/index.ts --dry-run",
     "verify-selectors": "ts-node src/index.ts --dry-run --verify-selectors",
+    "list-wishlist": "ts-node src/index.ts --dry-run --list-wishlist",
     "auth-debug": "ts-node src/index.ts --auth-debug",
     "test": "vitest run",
     "test:watch": "vitest",
