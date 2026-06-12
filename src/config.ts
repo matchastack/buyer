@@ -116,7 +116,14 @@ const DEFAULTS: Settings = {
   // stealth + challenge survival absorb the higher detection risk. Raise these
   // for a calmer, lower-risk watch.
   checkIntervalMs: 2_000,
-  pollSettleMs: 1_500,
+  // Max time a single poll waits for the Buy Now button to become clickable
+  // before treating the page as not-buyable and re-polling. The wait returns the
+  // instant an enabled Buy Now (or a definitive out-of-stock marker) appears, so
+  // a fast render pays nothing — the cap only bites on a slow/blank/challenge
+  // page. It must comfortably exceed the proxied client-side hydration time:
+  // through a residential proxy the buy box can take >1.5s to paint, and a cap
+  // shorter than that would declare a real restock out-of-stock and miss it.
+  pollSettleMs: 5_000,
   minPageLoadDelayMs: 800,
   maxPageLoadDelayMs: 1_800,
   headless: false,

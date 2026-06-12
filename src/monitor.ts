@@ -55,16 +55,25 @@ export async function checkStock(
     return { ...base, status: "unknown", price: null, pageTitle: null };
   }
 
-  // Adaptive settle: proceed as soon as the price anchor renders (or any
-  // product anchor), capped at settleMs. This replaces a blind fixed wait so a
-  // fast-rendering page is evaluated in a few hundred ms instead of always
-  // burning the full settle — the difference that lets the poll cadence sit
-  // under the ~3s restock window.
-  await waitForProductReady(page, settleMs);
+  // Speed-first detection: the ONLY thing that decides a buy is an enabled Buy
+  // Now button. Wait for it (bounded by settleMs) and fire the instant it is
+  // clickable — skip price, exact OOS reason, and even the challenge check on
+  // the hot path. Those are deliberately ignored here because checkout's
+  // fail-closed PayNow guardrail is the real safety net, and every extra read
+  // before the click risks losing the sub-2s restock window. The wait also
+  // returns early on a definitive out-of-stock marker, so an OOS poll doesn't
+  // burn the full settle.
+  const signal = await waitForBuySignal(page, settleMs);
 
+  if (signal === "in_stock") {
+    logger.info(MODULE, "stock_check", { item: item.name, status: "in_stock", price: null });
+    return { ...base, status: "in_stock", price: null, pageTitle: null };
+  }
+
+  // Not buyable this pass. Off the hot path now, classify *why* so survival
+  // backoff (anti-bot) and worker halt (login) still work.
   const pageTitle = await page.title().catch(() => null);
 
-  // Challenge detection takes priority over everything else
   const challenge = await detectChallenge(page, logger);
   if (challenge) {
     logger.error(MODULE, "anti_bot_halting", {
@@ -87,16 +96,10 @@ export async function checkStock(
     await describeProductSelectors(page, logger);
   }
 
+  // Best-effort price read for the audit log only — it does NOT affect status.
   const price = await extractPrice(page, item.name, logger);
-  const status = await determineStatus(page, item.name, logger, price);
-
-  logger.info(MODULE, "stock_check", {
-    item: item.name,
-    status,
-    price,
-  });
-
-  return { ...base, status, price, pageTitle };
+  logger.info(MODULE, "stock_check", { item: item.name, status: "out_of_stock", price });
+  return { ...base, status: "out_of_stock", price, pageTitle };
 }
 
 // ---------------------------------------------------------------------------
@@ -208,22 +211,50 @@ export async function waitForStock(
 // ---------------------------------------------------------------------------
 
 /**
- * Waits until the product page has rendered enough to evaluate, bounded by
- * `settleMs`. Returns as soon as the price anchor becomes visible; falls
- * through (no throw) on timeout so `determineStatus` still runs on whatever
- * did render. `settleMs <= 0` skips waiting entirely (fastest, riskiest).
+ * One instant classification pass over the buy controls:
+ *   - an enabled Buy Now button → "in_stock"
+ *   - an explicit out-of-stock marker (incl. a disabled Buy Now) → "out_of_stock"
+ *   - neither resolved yet (page may still be hydrating) → null
+ * Pure read, no waiting — `waitForBuySignal` re-runs it until one side resolves.
  */
-async function waitForProductReady(page: Page, settleMs: number): Promise<void> {
-  if (settleMs <= 0) return;
-  // price candidates are plain CSS — safe to union into one locator.
-  const anchor = SELECTORS.product.price.candidates.join(", ");
-  await page
-    .locator(anchor)
-    .first()
-    .waitFor({ state: "visible", timeout: settleMs })
-    .catch(() => {
-      /* not rendered within settleMs — proceed and let determineStatus decide */
-    });
+async function classifyBuySignal(
+  page: Page
+): Promise<"in_stock" | "out_of_stock" | null> {
+  const buyNow = await resolveSelector(page, SELECTORS.product.buyNowButton).catch(() => null);
+  if (buyNow) {
+    const enabled = await page.locator(buyNow.selector).first().isEnabled().catch(() => false);
+    if (enabled) return "in_stock";
+  }
+
+  const oos = await resolveSelector(page, SELECTORS.product.outOfStockIndicator).catch(() => null);
+  if (oos) return "out_of_stock";
+
+  return null;
+}
+
+/**
+ * Waits for a buy decision, bounded by `settleMs`. Returns the instant an
+ * enabled Buy Now button appears ("in_stock") or a definitive out-of-stock
+ * marker appears ("out_of_stock"), so neither a fast restock nor a clear OOS
+ * page pays the full settle. If neither resolves before the deadline (slow
+ * hydration, blank, or challenge page), returns "out_of_stock" — the caller
+ * then runs challenge/login detection to reclassify. `settleMs <= 0` does a
+ * single instant pass.
+ */
+async function waitForBuySignal(
+  page: Page,
+  settleMs: number
+): Promise<"in_stock" | "out_of_stock"> {
+  const deadline = Date.now() + Math.max(0, settleMs);
+
+  for (;;) {
+    const signal = await classifyBuySignal(page);
+    if (signal) return signal;
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return "out_of_stock";
+    await new Promise((r) => setTimeout(r, Math.min(150, remaining)));
+  }
 }
 
 async function extractPrice(
@@ -251,49 +282,6 @@ async function extractPrice(
   const price = parseFloat(match[0].replace(",", ""));
   logger.debug(MODULE, "price_extracted", { itemName, rawText: text.trim(), price });
   return isNaN(price) ? null : price;
-}
-
-async function determineStatus(
-  page: Page,
-  itemName: string,
-  logger: Logger,
-  price: number | null
-): Promise<StockCheckResult["status"]> {
-  // Explicit OOS markers take highest precedence
-  const oos = await resolveSelector(page, SELECTORS.product.outOfStockIndicator, 2_000).catch(
-    () => null
-  );
-  if (oos) {
-    logger.debug(MODULE, "oos_indicator_found", { itemName, selector: oos.selector });
-    return "out_of_stock";
-  }
-
-  // Enabled buy button = in stock
-  const buyNow = await resolveSelector(page, SELECTORS.product.buyNowButton, 2_000).catch(
-    () => null
-  );
-  if (buyNow) {
-    const enabled = await page.locator(buyNow.selector).first().isEnabled().catch(() => false);
-    if (enabled) return "in_stock";
-  }
-
-  const addToCart = await resolveSelector(page, SELECTORS.product.addToCartButton, 2_000).catch(
-    () => null
-  );
-  if (addToCart) {
-    const enabled = await page.locator(addToCart.selector).first().isEnabled().catch(() => false);
-    if (enabled) return "in_stock";
-  }
-
-  // Price present means the product page loaded correctly — no buy path means out of stock.
-  // Return "unknown" only when the page state is genuinely indeterminate (navigation error,
-  // challenge page, or completely unexpected DOM where even the price is absent).
-  if (price !== null) {
-    logger.debug(MODULE, "oos_inferred_no_buy_button", { itemName });
-    return "out_of_stock";
-  }
-
-  return "unknown";
 }
 
 export async function interruptibleSleep(ms: number, signal: AbortSignal): Promise<void> {

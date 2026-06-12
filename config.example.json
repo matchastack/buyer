@@ -16,7 +16,7 @@
   "settings": {
     "dryRun": true,
     "checkIntervalMs": 1500,
-    "pollSettleMs": 1200,
+    "pollSettleMs": 5000,
     "minPageLoadDelayMs": 500,
     "maxPageLoadDelayMs": 1200,
     "headless": false,
