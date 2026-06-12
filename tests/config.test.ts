@@ -260,8 +260,14 @@ describe("loadConfig", () => {
     expect(() => loadConfig(file)).toThrow(/minPageLoadDelayMs/i);
   });
 
-  it("defaults monitorMode to per-item", () => {
+  it("defaults monitorMode to wishlist", () => {
     const file = writeTmpConfig(VALID_CONFIG);
+    expect(loadConfig(file).settings.monitorMode).toBe("wishlist");
+  });
+
+  it("accepts per-item mode as an explicit fallback", () => {
+    const cfg = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, monitorMode: "per-item" } };
+    const file = writeTmpConfig(cfg);
     expect(loadConfig(file).settings.monitorMode).toBe("per-item");
   });
 

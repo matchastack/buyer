@@ -162,13 +162,21 @@ async function attemptCheckout(
 
     // Buy Now only — no Add to Cart fallback. The buy box hydrates after
     // domcontentloaded, so this WAITS (bounded) for a candidate to appear
-    // instead of sampling the instant page state.
-    const buyNow = await waitForSelectorSet(
-      page,
-      SELECTORS.product.buyNowButton,
-      BUY_NOW_WAIT_MS,
-      BUY_NOW_POLL_MS
-    );
+    // instead of sampling the instant page state. On the fast path the monitor
+    // confirmed an enabled Buy Now on this exact page milliseconds ago, so one
+    // instant pass usually suffices — fall back to the bounded wait only if the
+    // DOM shifted under us. Retries always take the bounded wait: their page
+    // just reloaded and is still hydrating.
+    const buyNow =
+      (skipInitialNav
+        ? await resolveSelector(page, SELECTORS.product.buyNowButton).catch(() => null)
+        : null) ??
+      (await waitForSelectorSet(
+        page,
+        SELECTORS.product.buyNowButton,
+        BUY_NOW_WAIT_MS,
+        BUY_NOW_POLL_MS
+      ));
     timer.mark("locate_buy_now");
     if (!buyNow) {
       logger.warn(MODULE, "buy_now_unavailable", { item: item.name, attempt, url: page.url() });

@@ -144,7 +144,13 @@ const DEFAULTS: Settings = {
   challengeBackoffBaseMs: 30_000,  // First challenge backoff (grows exponentially)
   challengeBackoffMaxMs: 300_000,  // Cap challenge backoff at 5 minutes
   maxConsecutiveChallenges: 6,     // Give up after 6 challenges with no good check between
-  monitorMode: "per-item",         // Safe default — unchanged behaviour; opt into "wishlist"
+  // Wishlist is the default: one watcher load per cycle regardless of item
+  // count (far lower anti-bot footprint than N PDP polls), stock read from the
+  // embedded JSON at domcontentloaded (no render-settle tax) → faster, safer
+  // detection for contested drops. Requires every item URL to yield a product
+  // id and the items to be on the account wishlist; set "per-item" to fall
+  // back to direct PDP polling when an item can't live on the wishlist.
+  monitorMode: "wishlist",
   loginUrl: "https://member.lazada.sg/user/login", // Lazada's current login page (old /customer/account/login 404s)
   wishlistUrl: "https://my.lazada.sg/wishlist/index",
   wishlistPollIntervalMs: 2_000,   // One watcher poll regardless of item count

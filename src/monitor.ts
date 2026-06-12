@@ -214,7 +214,10 @@ export async function waitForStock(
  * One instant classification pass over the buy controls:
  *   - an enabled Buy Now button → "in_stock"
  *   - an explicit out-of-stock marker (incl. a disabled Buy Now) → "out_of_stock"
- *   - neither resolved yet (page may still be hydrating) → null
+ *   - price rendered but no buy path → "out_of_stock" (hydration gate: the page
+ *     is up, it just isn't buyable — don't wait out the settle for a marker
+ *     that will never appear)
+ *   - nothing resolved yet (page still hydrating) → null
  * Pure read, no waiting — `waitForBuySignal` re-runs it until one side resolves.
  */
 async function classifyBuySignal(
@@ -228,6 +231,13 @@ async function classifyBuySignal(
 
   const oos = await resolveSelector(page, SELECTORS.product.outOfStockIndicator).catch(() => null);
   if (oos) return "out_of_stock";
+
+  // Hydration gate: price visible + no enabled Buy Now ⇒ the page has rendered
+  // and is not buyable — out_of_stock now, instead of burning the full settle
+  // on an OOS page whose marker none of the candidates recognize. Price is a
+  // RENDER signal only: never read as a value, never gates the buy.
+  const priceVisible = await resolveSelector(page, SELECTORS.product.price).catch(() => null);
+  if (priceVisible) return "out_of_stock";
 
   return null;
 }
