@@ -29,6 +29,19 @@ export class PhaseTimer {
     this.lastMarkMs = t;
   }
 
+  /**
+   * Records `name` as the delta from the previous mark up to an explicit
+   * absolute time `at` (Date.now()-domain). Lets overlapping phases be
+   * attributed to the instant each milestone was actually observed — used by
+   * the checkout path, where PayNow selection now overlaps the checkout-page
+   * hydration. Callers must pass non-decreasing `at` values (clamp at the call
+   * site) so a phase delta is never negative.
+   */
+  markAt(name: string, at: number): void {
+    this.phases[name] = at - this.lastMarkMs;
+    this.lastMarkMs = at;
+  }
+
   /** Milliseconds since the timer was created. */
   totalMs(): number {
     return this.now() - this.startMs;

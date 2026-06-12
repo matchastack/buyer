@@ -43,6 +43,19 @@ const CHECKOUT_READY_WAIT_MS = 15_000;
 const PAYMENT_OPTIONS_WAIT_MS = 8_000;
 const CONFIRMATION_WAIT_MS = 20_000;
 
+// Poll cadence for the bounded readiness/confirmation loops (was an inline
+// 250ms). Faster polling returns the instant an element appears; the cost is
+// pure CPU — every pass is a client-side DOM/URL read, never a Lazada request —
+// so a tight cadence trims latency without adding any anti-bot footprint.
+const CHECKOUT_POLL_MS = 75;
+// detectChallenge is also a client-side DOM+URL check; decouple it from the
+// 75ms selector poll so it still fires at most ~once per this interval rather
+// than ~13×/s. A punish/captcha redirect is the slow, seconds-long kind, so
+// ~300ms cadence catches it comfortably.
+const CHALLENGE_CHECK_MS = 300;
+// Explicit fast poll for the Buy Now wait (was the waitForSelectorSet default 150).
+const BUY_NOW_POLL_MS = 50;
+
 // Fail-closed guardrail (dev phase): the checkout page offers a saved card next
 // to PayNow, so Place Order is NEVER clicked unless PayNow is positively
 // confirmed as the selected method. This sentinel marks that abort; the retry
@@ -153,7 +166,8 @@ async function attemptCheckout(
     const buyNow = await waitForSelectorSet(
       page,
       SELECTORS.product.buyNowButton,
-      BUY_NOW_WAIT_MS
+      BUY_NOW_WAIT_MS,
+      BUY_NOW_POLL_MS
     );
     timer.mark("locate_buy_now");
     if (!buyNow) {
@@ -176,17 +190,28 @@ async function attemptCheckout(
     logger.info(MODULE, "clicked_buy_now", { item: item.name, attempt });
 
     // Element gate: we are "on the checkout page" when the Place Order CTA is
-    // visible. No URL assumption — see CHECKOUT_READY_WAIT_MS note. Challenge-
-    // aware: an anti-bot punish redirect here throws immediately instead of
-    // burning the full wait (the live x5sec punish hit exactly this window).
-    await waitForCheckoutReady(page, logger);
-    timer.mark("buy_now_to_checkout");
+    // visible. No URL assumption — see CHECKOUT_READY_WAIT_MS note. This single
+    // overlapped loop also selects/confirms PayNow WHILE the page hydrates, so
+    // the payment work hides inside the (irreducible) Buy Now → checkout
+    // transition instead of running after it. Challenge-aware: an anti-bot
+    // punish redirect here throws immediately instead of burning the full wait
+    // (the live x5sec punish hit exactly this window).
+    const marks = { ctaSeenAt: null as number | null, payNowConfirmedAt: null as number | null };
+    const outcome = await waitForCheckoutReadyAndPayNow(page, logger, marks);
+
+    // Preserve the two phases even though the work overlapped: buy_now_to_checkout
+    // = until the Place Order CTA was first seen; select_payment = the residual
+    // PayNow time beyond that (≈0 when payment finished inside the hydration
+    // window, non-zero only when payment was the bottleneck). Clamp so the delta
+    // is never negative when PayNow confirms before the CTA is seen.
+    const ctaSeenAt = marks.ctaSeenAt ?? Date.now();
+    const payConfirmedAt = Math.max(marks.payNowConfirmedAt ?? ctaSeenAt, ctaSeenAt);
+    timer.markAt("buy_now_to_checkout", ctaSeenAt);
+    timer.markAt("select_payment", payConfirmedAt);
 
     logger.info(MODULE, "on_checkout_page", { item: item.name, url: page.url() });
 
-    const payNowConfirmed = await ensurePayNowSelected(page, logger);
-    timer.mark("select_payment");
-    if (!payNowConfirmed) {
+    if (outcome.kind === "paynow-unconfirmed") {
       logger.error(MODULE, "paynow_not_confirmed", {
         item: item.name,
         attempt,
@@ -252,30 +277,139 @@ async function setQuantity(page: Page, quantity: number, logger: Logger): Promis
   logger.debug(MODULE, "quantity_set", { quantity });
 }
 
+type CheckoutReadyOutcome =
+  | { kind: "ready" } //               Place Order CTA visible AND PayNow confirmed
+  | { kind: "paynow-unconfirmed" }; // CTA up but PayNow not confirmable in time
+
 /**
- * Waits (bounded) for the Buy Now → checkout navigation to land: ready when the
- * Place Order CTA is visible. Each pass also runs detectChallenge so an
- * anti-bot redirect (punish/captcha) throws ChallengeDetectedError immediately
- * — without this, a punished session looks like a selector timeout and the
- * retry loop re-clicks Buy Now into the same flagged session.
+ * Runs detectChallenge at most once per CHALLENGE_CHECK_MS wall-clock, no matter
+ * how fast the caller polls — so dropping the selector poll to 75ms doesn't
+ * multiply the (client-side, but still CPU) challenge checks. `lastAt` is the
+ * timestamp of the previous actual check (0 = never → checks on the first pass).
+ * Throws ChallengeDetectedError on detection, exactly like the inline checks it
+ * replaces; returns the timestamp to thread into the next call.
  */
-async function waitForCheckoutReady(page: Page, logger: Logger): Promise<void> {
-  const set = SELECTORS.checkout.placeOrderButton;
-  const deadline = Date.now() + CHECKOUT_READY_WAIT_MS;
+async function throttledChallengeCheck(
+  page: Page,
+  logger: Logger,
+  lastAt: number
+): Promise<number> {
+  const now = Date.now();
+  if (now - lastAt < CHALLENGE_CHECK_MS) return lastAt;
+  const challenge = await detectChallenge(page, logger);
+  if (challenge) throw new ChallengeDetectedError(challenge);
+  return now;
+}
 
-  do {
-    const resolved = await resolveSelector(page, set).catch(() => null);
-    if (resolved) return;
+/**
+ * Overlapped checkout-ready + PayNow-select loop. Replaces the former sequential
+ * waitForCheckoutReady → ensurePayNowSelected: it drives PayNow selection WHILE
+ * the checkout page's Place Order CTA hydrates, so the payment work hides inside
+ * the (irreducible) Buy Now → checkout transition instead of running after it.
+ *
+ * Two independent deadlines coexist:
+ *   - CHECKOUT_READY_WAIT_MS for the Place Order CTA. If it never appears, throws
+ *     SelectorNotFoundError — identical to the old waitForCheckoutReady timeout,
+ *     so the retry loop (transient OOS) and logs are unchanged.
+ *   - PAYMENT_OPTIONS_WAIT_MS for a positive PayNow confirmation, measured from
+ *     when the CTA is first seen (matching the old behaviour, where PayNow's clock
+ *     only started after the checkout page was up). On timeout returns
+ *     { kind: "paynow-unconfirmed" } and the caller ABORTS without placing the
+ *     order (fail-closed guardrail).
+ *
+ * Success ({ kind: "ready" }) requires BOTH the CTA visible AND isPayNowConfirmed
+ * true — the only return that lets the caller click Place Order, so the guardrail
+ * cannot be bypassed. Each pass also runs the (throttled) challenge check so an
+ * anti-bot punish/captcha redirect throws ChallengeDetectedError immediately
+ * instead of masquerading as a selector timeout.
+ *
+ * `marks` is mutated in place with the absolute timestamps of the two milestones
+ * so the caller can still report buy_now_to_checkout and select_payment as
+ * distinct (now overlapping) phases.
+ */
+async function waitForCheckoutReadyAndPayNow(
+  page: Page,
+  logger: Logger,
+  marks: { ctaSeenAt: number | null; payNowConfirmedAt: number | null }
+): Promise<CheckoutReadyOutcome> {
+  const ctaSet = SELECTORS.checkout.placeOrderButton;
+  const startAt = Date.now();
+  const ctaDeadline = startAt + CHECKOUT_READY_WAIT_MS;
 
-    const challenge = await detectChallenge(page, logger);
-    if (challenge) throw new ChallengeDetectedError(challenge);
+  let payNowConfirmed = false;
+  let ctaVisible = false;
+  let clicked = false;
+  let lastClickAt = 0;
+  let lastChallengeCheckAt = 0;
 
-    await page.waitForTimeout(250);
-  } while (Date.now() < deadline);
+  for (;;) {
+    const now = Date.now();
 
-  // Same error waitForSelectorSet throws for a required set, so the retry
-  // loop and logs are unchanged.
-  throw new SelectorNotFoundError(set.description, set.candidates);
+    // (a) Payment — only until positively confirmed. The live page pre-selects
+    // the saved CARD, not PayNow, so the click below is the expected path and the
+    // indicator check is the proof it landed.
+    if (!payNowConfirmed) {
+      if (await isPayNowConfirmed(page)) {
+        payNowConfirmed = true;
+        marks.payNowConfirmedAt = Date.now();
+        logger.info(MODULE, "payment_method_selected", { paymentMethod: PAYMENT_METHOD, clicked });
+      } else if (now - lastClickAt >= 1_000) {
+        // Options render progressively, so re-scan until confirmed — but click at
+        // most once per second: the card needs a re-render beat to flip to
+        // selected, and hammering it risks toggling the cashier widget.
+        candidateScan: for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
+          const options = page.locator(candidate);
+          const count = await options.count().catch(() => 0);
+          for (let i = 0; i < count; i++) {
+            const option = options.nth(i);
+            const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
+            if (text.includes(PAYMENT_METHOD)) {
+              await option.click().catch(() => {});
+              lastClickAt = Date.now();
+              clicked = true;
+              logger.debug(MODULE, "paynow_row_clicked", { candidate });
+              break candidateScan; // re-check the indicator before clicking again
+            }
+          }
+        }
+      }
+    }
+
+    // (b) Checkout-page readiness — Place Order CTA visible yet?
+    if (!ctaVisible) {
+      const resolved = await resolveSelector(page, ctaSet).catch(() => null);
+      if (resolved) {
+        ctaVisible = true;
+        marks.ctaSeenAt = Date.now();
+      }
+    }
+
+    // Dual exit: succeed only when BOTH hold — never returns "ready" (the only
+    // outcome that lets Place Order be clicked) without a positive PayNow confirm.
+    if (ctaVisible && payNowConfirmed) return { kind: "ready" };
+
+    // PayNow deadline — gated on the CTA being up so PayNow still gets a full
+    // PAYMENT_OPTIONS_WAIT_MS measured from "checkout page is up", as it did when
+    // it ran strictly after the CTA wait.
+    if (
+      !payNowConfirmed &&
+      ctaVisible &&
+      Date.now() - (marks.ctaSeenAt ?? startAt) >= PAYMENT_OPTIONS_WAIT_MS
+    ) {
+      logger.warn(MODULE, "paynow_confirm_timeout", { sinceMs: Date.now() - startAt });
+      return { kind: "paynow-unconfirmed" };
+    }
+
+    // CTA deadline — never showed up → same SelectorNotFoundError the old
+    // waitForCheckoutReady threw (retryable; transient-OOS retries still fire).
+    if (!ctaVisible && Date.now() >= ctaDeadline) {
+      throw new SelectorNotFoundError(ctaSet.description, ctaSet.candidates);
+    }
+
+    lastChallengeCheckAt = await throttledChallengeCheck(page, logger, lastChallengeCheckAt);
+
+    await page.waitForTimeout(CHECKOUT_POLL_MS);
+  }
 }
 
 /**
@@ -300,59 +434,6 @@ async function isPayNowConfirmed(page: Page): Promise<boolean> {
 }
 
 /**
- * Ensures PayNow is the selected payment method: confirms via the selected
- * indicator first (PayNow is often pre-selected), otherwise finds and clicks
- * the PayNow row and re-checks. Returns false at the deadline — the caller
- * then ABORTS without placing the order (fail-closed guardrail).
- */
-async function ensurePayNowSelected(page: Page, logger: Logger): Promise<boolean> {
-  const deadline = Date.now() + PAYMENT_OPTIONS_WAIT_MS;
-  let lastClickAt = 0;
-  let clicked = false;
-
-  do {
-    // Already selected? (live page pre-selects the saved CARD, not PayNow —
-    // so the click below is the expected path, and this check is the proof
-    // the click landed.)
-    if (await isPayNowConfirmed(page)) {
-      logger.info(MODULE, "payment_method_selected", {
-        paymentMethod: PAYMENT_METHOD,
-        clicked,
-      });
-      return true;
-    }
-
-    // Find a PayNow row among the option candidates and click it. Options
-    // render progressively, so keep re-scanning until the deadline — but click
-    // at most once per second: the card needs a re-render beat to flip to
-    // selected, and hammering it risks toggling the cashier widget.
-    if (Date.now() - lastClickAt >= 1_000) {
-      candidateScan: for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
-        const options = page.locator(candidate);
-        const count = await options.count().catch(() => 0);
-
-        for (let i = 0; i < count; i++) {
-          const option = options.nth(i);
-          const text = ((await option.textContent().catch(() => "")) ?? "").toLowerCase();
-
-          if (text.includes(PAYMENT_METHOD)) {
-            await option.click().catch(() => {});
-            lastClickAt = Date.now();
-            clicked = true;
-            logger.debug(MODULE, "paynow_row_clicked", { candidate });
-            break candidateScan; // re-check the indicator before clicking again
-          }
-        }
-      }
-    }
-
-    await page.waitForTimeout(250);
-  } while (Date.now() < deadline);
-
-  return false;
-}
-
-/**
  * Polls (bounded) for the outcome of Place Order. Two success shapes:
  *  - classic "Thank you" order page (successHeading) — extract the order number;
  *  - the PayNow QR / cashier page (paymentPending markers, or a navigation to a
@@ -369,6 +450,7 @@ async function waitForConfirmation(
   debugDir: string
 ): Promise<CheckoutResult> {
   const deadline = Date.now() + CONFIRMATION_WAIT_MS;
+  let lastChallengeCheckAt = 0;
 
   do {
     const heading = await resolveSelector(page, SELECTORS.confirmation.successHeading).catch(
@@ -379,8 +461,17 @@ async function waitForConfirmation(
       const orderNumber = orderNumberText?.trim().replace(/[^A-Za-z0-9-]/g, "") ?? null;
 
       logger.info(MODULE, "order_confirmed", { item: itemName, orderNumber });
-      await captureNamedSnapshot(page, `order-confirmed-${itemName}`, debugDir, logger);
-      return { success: true, orderNumber, error: null };
+      // Fire-and-forget the audit snapshot so success returns the instant it's
+      // detected — the screenshot+HTML write no longer inflates the measured
+      // place_order_to_confirm or the real time-to-QR. The caller drains
+      // pendingSnapshot before any page.close() so the capture isn't truncated.
+      const pendingSnapshot = captureNamedSnapshot(
+        page,
+        `order-confirmed-${itemName}`,
+        debugDir,
+        logger
+      ).catch(() => {});
+      return { success: true, orderNumber, error: null, pendingSnapshot };
     }
 
     const qr = await resolveSelector(page, SELECTORS.confirmation.paymentPending).catch(
@@ -394,16 +485,20 @@ async function waitForConfirmation(
         url,
         marker: qr?.selector ?? "url",
       });
-      await captureNamedSnapshot(page, `order-confirmed-${itemName}`, debugDir, logger);
-      return { success: true, orderNumber: null, error: null };
+      const pendingSnapshot = captureNamedSnapshot(
+        page,
+        `order-confirmed-${itemName}`,
+        debugDir,
+        logger
+      ).catch(() => {});
+      return { success: true, orderNumber: null, error: null, pendingSnapshot };
     }
 
     // A punish/captcha redirect can equally follow Place Order — surface it
     // immediately instead of timing out into a misleading "not detected".
-    const challenge = await detectChallenge(page, logger);
-    if (challenge) throw new ChallengeDetectedError(challenge);
+    lastChallengeCheckAt = await throttledChallengeCheck(page, logger, lastChallengeCheckAt);
 
-    await page.waitForTimeout(250);
+    await page.waitForTimeout(CHECKOUT_POLL_MS);
   } while (Date.now() < deadline);
 
   // Deadline reached with neither success shape — scan once for an explicit
