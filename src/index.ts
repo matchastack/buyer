@@ -40,6 +40,14 @@ const CLI_DEBUG_DOM = args.includes("--debug-dom");
 const CLI_AUTH_DEBUG = args.includes("--auth-debug");
 const AUTH_DEBUG_PAUSE_MS = 2_000;
 
+// Same key the monitor/checkout modules use for the shared rate limiter.
+const LAZADA_DOMAIN = "www.lazada.sg";
+// Buy Now wait for the wishlist buyer's restock reload: the reload returns at
+// navigation COMMIT (before document parse), so this bounded wait absorbs the
+// whole parse+hydration window — it must comfortably exceed a proxied PDP
+// render, while still clicking the instant the button is clickable.
+const BUYER_BUY_NOW_WAIT_MS = 10_000;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -190,14 +198,30 @@ async function runBuyerWorker(
   gate: RestockGate,
   signal: AbortSignal,
   itemStatus: ItemStatus,
-  runtimeStatus: RuntimeStatus,
-  activeBuys: { count: number }
+  runtimeStatus: RuntimeStatus
 ): Promise<void> {
   const fastRetry: RetryProfile = {
     maxRetries: config.settings.buyMaxRetries,
     baseMs: config.settings.buyRetryBaseMs,
     maxMs: config.settings.buyRetryMaxMs,
   };
+
+  // Pre-warm: load the PDP once at startup so the page idles warm — the JS/CSS
+  // subresources are then served from cache on the buy-time reload (images are
+  // already blocked), which is what makes that reload fast. Best-effort: a
+  // failed pre-warm only costs speed, the buy-time reload is the real load.
+  // The rate-limiter acquire staggers the N buyer pre-warms at startup.
+  try {
+    await rateLimiter.acquire(LAZADA_DOMAIN);
+    if (signal.aborted) return;
+    await navigateTo(page, item.url, logger);
+    logger.info("buyer", "pdp_prewarmed", { item: item.name, productId });
+  } catch (err) {
+    logger.warn("buyer", "pdp_prewarm_failed", {
+      item: item.name,
+      error: (err as Error).message,
+    });
+  }
 
   while (!signal.aborted) {
     await gate.waitForRestock(signal);
@@ -209,18 +233,26 @@ async function runBuyerWorker(
     itemStatus.lastChecked = new Date().toISOString();
     runtimeStatus.totalCheckoutAttempts++;
 
-    // While any buy is in flight the watcher pauses its wishlist polling —
-    // the buy itself is the session's peak request rate, and stacking the
-    // 1-2s wishlist reloads on top is what primes anti-bot punishment.
-    activeBuys.count++;
     try {
-      // Warm reload: a page held open for hours won't auto-enable Buy Now, but
-      // the reload skips the rate limiter and reuses the warm session. The first
-      // checkout attempt then acts on this just-loaded page (alreadyOnProductPage).
-      await navigateTo(page, item.url, logger);
+      // Warm reload, overlapped with Buy Now detection: a page held open won't
+      // auto-enable Buy Now, so reload — but return at navigation COMMIT and let
+      // checkout's bounded Buy Now wait absorb parse+hydration, clicking the
+      // instant the button is clickable instead of serializing behind
+      // domcontentloaded. Skips the rate limiter (the buy is the priority);
+      // subresources come from the pre-warm's cache.
+      await navigateTo(page, item.url, logger, 3, "commit");
       const reloadMs = Date.now() - instockAt;
 
-      const checkoutResult = await checkout(page, item, config, rateLimiter, logger, true, fastRetry);
+      const checkoutResult = await checkout(
+        page,
+        item,
+        config,
+        rateLimiter,
+        logger,
+        true,
+        fastRetry,
+        BUYER_BUY_NOW_WAIT_MS
+      );
 
       logger.info("buyer", "instock_to_confirm", {
         item: item.name,
@@ -252,8 +284,6 @@ async function runBuyerWorker(
         throw err; // fail-closed on the buy path
       }
       logger.error("buyer", "buy_error", { item: item.name, error: (err as Error).message });
-    } finally {
-      activeBuys.count--;
     }
   }
 }
@@ -651,10 +681,6 @@ async function main(): Promise<void> {
     };
 
     const registry = new RestockRegistry();
-    // Shared buy-in-flight counter: buyers increment around a buy, the watcher
-    // skips wishlist polls while it is non-zero (lower anti-bot footprint at
-    // the most sensitive moment). Fired gates stay latched, so nothing is lost.
-    const activeBuys = { count: 0 };
     // Non-null: loadConfig guarantees every URL yields an id in wishlist mode.
     const productIds = config.items.map((it) => extractProductId(it.url)!);
     const gates = productIds.map((id) => registry.register(id));
@@ -680,8 +706,7 @@ async function main(): Promise<void> {
           s.checkCount++;
         }
       },
-      debugDir,
-      () => activeBuys.count > 0
+      debugDir
     ).finally(() => {
       // Watcher death (login_required / circuit breaker) blinds all buyers, so
       // halt the run: abort wakes idle buyers, which then exit.
@@ -700,8 +725,7 @@ async function main(): Promise<void> {
         gates[i]!,
         controller.signal,
         itemStatuses[i]!,
-        runtimeStatus,
-        activeBuys
+        runtimeStatus
       )
     );
 

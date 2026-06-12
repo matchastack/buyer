@@ -33,7 +33,9 @@ const PAYMENT_METHOD = "paynow";
 // Lazada pages are client-rendered: navigateTo returns at domcontentloaded but
 // the buy box / checkout CTAs hydrate hundreds of ms later. These are the
 // bounded waits for each stage (waitForSelectorSet returns the moment the
-// element appears, so a fast render costs a single pass).
+// element appears, so a fast render costs a single pass). Callers that arrive
+// on a commit-time page (the wishlist buyer's overlapped reload) pass a longer
+// buyNowWaitMs so the wait absorbs document parse + hydration too.
 const BUY_NOW_WAIT_MS = 3_000;
 // Absorbs the Buy Now → checkout navigation too: arrival on the checkout page
 // is detected by the Place Order CTA appearing, NOT by URL (Lazada SG checkout
@@ -75,7 +77,8 @@ export async function checkout(
   rateLimiter: RateLimiter,
   logger: Logger,
   alreadyOnProductPage = false,
-  retry?: RetryProfile
+  retry?: RetryProfile,
+  buyNowWaitMs = BUY_NOW_WAIT_MS
 ): Promise<CheckoutResult> {
   // ── Dry-run guard — must be first ──────────────────────────────────────────
   if (config.settings.dryRun) {
@@ -97,7 +100,16 @@ export async function checkout(
     // Only the very first attempt can act on the live in-stock page. Any retry
     // means the previous attempt navigated away, so it must reload (and pace).
     const skipInitialNav = alreadyOnProductPage && attempt === 1;
-    const result = await attemptCheckout(page, item, config, rateLimiter, logger, attempt, skipInitialNav);
+    const result = await attemptCheckout(
+      page,
+      item,
+      config,
+      rateLimiter,
+      logger,
+      attempt,
+      skipInitialNav,
+      buyNowWaitMs
+    );
 
     if (result.success) return result;
 
@@ -141,7 +153,8 @@ async function attemptCheckout(
   rateLimiter: RateLimiter,
   logger: Logger,
   attempt: number,
-  skipInitialNav: boolean
+  skipInitialNav: boolean,
+  buyNowWaitMs: number
 ): Promise<CheckoutResult> {
   const timer = new PhaseTimer();
   const debugDir = path.join(config.settings.dataDir, "debug");
@@ -174,7 +187,7 @@ async function attemptCheckout(
       (await waitForSelectorSet(
         page,
         SELECTORS.product.buyNowButton,
-        BUY_NOW_WAIT_MS,
+        buyNowWaitMs,
         BUY_NOW_POLL_MS
       ));
     timer.mark("locate_buy_now");
@@ -274,9 +287,17 @@ async function attemptCheckout(
 // ---------------------------------------------------------------------------
 
 async function setQuantity(page: Page, quantity: number, logger: Logger): Promise<void> {
-  const resolved = await resolveSelector(page, SELECTORS.product.quantityInput, 3_000);
+  // The quantity input hydrates with (or just after) the buy box, so this must
+  // WAIT bounded, not sample the instant state — an instant resolveSelector here
+  // silently skipped the input on a live run and bought quantity 1.
+  const resolved = await waitForSelectorSet(page, SELECTORS.product.quantityInput, 2_000).catch(
+    () => null
+  );
   if (!resolved) {
-    logger.warn(MODULE, "quantity_input_not_found");
+    logger.warn(MODULE, "quantity_input_not_found", {
+      requestedQuantity: quantity,
+      consequence: "proceeding with quantity 1",
+    });
     return;
   }
   const locator = page.locator(resolved.selector).first();
@@ -361,10 +382,11 @@ async function waitForCheckoutReadyAndPayNow(
         payNowConfirmed = true;
         marks.payNowConfirmedAt = Date.now();
         logger.info(MODULE, "payment_method_selected", { paymentMethod: PAYMENT_METHOD, clicked });
-      } else if (now - lastClickAt >= 1_000) {
-        // Options render progressively, so re-scan until confirmed — but click at
-        // most once per second: the card needs a re-render beat to flip to
-        // selected, and hammering it risks toggling the cashier widget.
+      } else if (now - lastClickAt >= 500) {
+        // Options render progressively, so re-scan until confirmed — but throttle
+        // the clicks: the card needs a re-render beat to flip to selected. A
+        // re-click on the already-selected radio row is idempotent, so 500ms
+        // (was 1s) trims the residual select_payment latency safely.
         candidateScan: for (const candidate of SELECTORS.checkout.paymentMethodOption.candidates) {
           const options = page.locator(candidate);
           const count = await options.count().catch(() => 0);

@@ -39,14 +39,19 @@ export async function navigateTo(
   page: Page,
   url: string,
   logger: Logger,
-  maxAttempts = 3
+  maxAttempts = 3,
+  // "commit" returns as soon as the navigation commits (before document parse),
+  // for callers whose next step is itself a bounded element wait that absorbs
+  // hydration — the wishlist buyer's restock reload uses this to overlap the
+  // page load with Buy Now detection instead of serializing behind it.
+  waitUntil: "domcontentloaded" | "commit" | "load" = "domcontentloaded"
 ): Promise<void> {
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     logger.debug(MODULE, "navigate_attempt", { url, attempt, maxAttempts });
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await page.goto(url, { waitUntil, timeout: 30_000 });
       logger.debug(MODULE, "navigate_ok", { url, attempt });
       return;
     } catch (err) {
