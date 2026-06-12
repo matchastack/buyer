@@ -3,9 +3,10 @@
  *
  * Lifecycle:
  *   1. Load and validate config + env-var credentials
- *   2. Launch browser, restore session, verify login
+ *   2. Launch a persistent Chromium profile (carries the session + device-trust
+ *      state across runs), restore cookie backup, verify login
  *   3. Start one monitor+checkout worker per configured item
- *   4. Shut down gracefully on SIGINT/SIGTERM
+ *   4. Shut down gracefully on SIGINT/SIGTERM (closes the context → flushes profile)
  *
  * Promise.allSettled is used so a failure on one item does not abort others.
  */
@@ -430,39 +431,45 @@ async function main(): Promise<void> {
   // throws if only partially set so we never silently leak the real IP.
   const proxyCreds = loadProxyCredentials(config.settings.proxy?.server);
 
-  const browser = await chromium.launch({
-    headless: config.settings.headless,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-    ],
-  });
-
-  const context: BrowserContext = await browser.newContext({
-    ...(proxyCreds
-      ? {
-          proxy: {
-            server: proxyCreds.server,
-            username: proxyCreds.username,
-            password: proxyCreds.password,
-            ...(config.settings.proxy?.bypass ? { bypass: config.settings.proxy.bypass } : {}),
-          },
-        }
-      : {}),
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    viewport: { width: 1280, height: 800 },
-    locale: "en-SG",
-    timezoneId: "Asia/Singapore",
-    // Client hints + Accept-Language aligned with the Windows/Chrome-124 UA above
-    // (a mismatch between UA and client hints is itself a bot tell).
-    extraHTTPHeaders: {
-      "Accept-Language": "en-SG,en;q=0.9",
-      "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-      "sec-ch-ua-mobile": "?0",
-      "sec-ch-ua-platform": '"Windows"',
-    },
-  });
+  // Persistent profile (not an ephemeral context): the on-disk profile carries
+  // cookies + localStorage + IndexedDB + a stable canvas/WebGL fingerprint across
+  // runs, so Lazada/Alibaba's device-trust tokens survive and a once-verified
+  // device stays verified — the single biggest lever on how often the post-login
+  // security-verification (MF01) page fires. There is no separate Browser object;
+  // launchPersistentContext returns the context directly.
+  const context: BrowserContext = await chromium.launchPersistentContext(
+    config.settings.userDataDir,
+    {
+      headless: config.settings.headless,
+      args: [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+      ],
+      ...(proxyCreds
+        ? {
+            proxy: {
+              server: proxyCreds.server,
+              username: proxyCreds.username,
+              password: proxyCreds.password,
+              ...(config.settings.proxy?.bypass ? { bypass: config.settings.proxy.bypass } : {}),
+            },
+          }
+        : {}),
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      viewport: { width: 1280, height: 800 },
+      locale: "en-SG",
+      timezoneId: "Asia/Singapore",
+      // Client hints + Accept-Language aligned with the Windows/Chrome-124 UA above
+      // (a mismatch between UA and client hints is itself a bot tell).
+      extraHTTPHeaders: {
+        "Accept-Language": "en-SG,en;q=0.9",
+        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+      },
+    }
+  );
 
   if (proxyCreds) {
     logger.info("main", "proxy_enabled", { server: proxyCreds.server }); // creds never logged
@@ -490,11 +497,27 @@ async function main(): Promise<void> {
 
   const controller = new AbortController();
 
+  // Periodically back up cookies to sessionFile. The persistent profile already
+  // holds the authoritative session on disk, but a JSON cookie backup is cheap
+  // insurance: if the process is killed uncleanly (no SIGINT) after the user
+  // clears an MF01 mid-run, the refreshed auth cookies are still captured.
+  const SESSION_FLUSH_MS = 60_000;
+  const sessionFlush = setInterval(() => {
+    void saveSession(context, config.settings.sessionFile, logger).catch(() => {});
+  }, SESSION_FLUSH_MS);
+  sessionFlush.unref?.();
+
+  let shuttingDown = false;
   const shutdown = async (reason: string): Promise<void> => {
+    if (shuttingDown) return; // idempotent: signal + normal-completion can both call this
+    shuttingDown = true;
     logger.info("main", "shutdown_initiated", { reason });
+    clearInterval(sessionFlush);
     controller.abort();
     await saveSession(context, config.settings.sessionFile, logger).catch(() => {});
-    await browser.close().catch(() => {});
+    // Closing the persistent context flushes the profile (localStorage/IndexedDB)
+    // to disk — this is what preserves the device-trust state for the next run.
+    await context.close().catch(() => {});
   };
 
   process.on("SIGINT", () => void shutdown("SIGINT"));

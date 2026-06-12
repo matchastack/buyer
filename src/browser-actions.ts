@@ -113,6 +113,39 @@ export async function fillInput(
   logger.debug(MODULE, "fill_ok", { description: selectorSet.description });
 }
 
+/**
+ * Like fillInput, but types character-by-character with a randomized per-key
+ * delay (and clears the field first) so a credential isn't filled in one
+ * instantaneous DOM write. An instant sub-second login is itself a bot tell that
+ * raises the odds of a post-login security challenge — this paces it like a
+ * human. Still SelectorSet-only (never raw CSS); the value is never logged.
+ */
+export async function fillInputHumanlike(
+  page: Page,
+  selectorSet: SelectorSet,
+  value: string,
+  logger: Logger,
+  options?: { timeout?: number; minDelayMs?: number; maxDelayMs?: number }
+): Promise<void> {
+  logger.debug(MODULE, "fill_humanlike_resolving", { description: selectorSet.description });
+
+  const resolved = await resolveSelector(page, selectorSet, options?.timeout ?? 5_000);
+  if (!resolved) {
+    throw new SelectorNotFoundError(selectorSet.description, selectorSet.candidates);
+  }
+
+  const locator: Locator = page.locator(resolved.selector).first();
+  await locator.click({ timeout: 10_000 });
+  await locator.fill("", { timeout: 10_000 }); // clear any prefill before typing
+
+  const minDelay = options?.minDelayMs ?? 60;
+  const maxDelay = options?.maxDelayMs ?? 160;
+  const delay = minDelay + Math.floor(Math.random() * Math.max(0, maxDelay - minDelay));
+  await locator.pressSequentially(value, { delay, timeout: 15_000 });
+
+  logger.debug(MODULE, "fill_humanlike_ok", { description: selectorSet.description });
+}
+
 // ---------------------------------------------------------------------------
 // Text extraction
 // ---------------------------------------------------------------------------

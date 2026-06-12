@@ -288,6 +288,12 @@ describe("loadConfig", () => {
     expect(loadConfig(file).settings.loginUrl).toBe("https://member.lazada.sg/user/login");
   });
 
+  it("derives userDataDir (persistent profile) from dataDir", () => {
+    const cfg = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, dataDir: "runtime" } };
+    const file = writeTmpConfig(cfg);
+    expect(loadConfig(file).settings.userDataDir).toBe(path.join("runtime", "profile"));
+  });
+
   it("throws when loginUrl is not https", () => {
     const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, loginUrl: "ftp://x" } };
     const file = writeTmpConfig(bad);

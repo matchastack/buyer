@@ -133,6 +133,7 @@ const DEFAULTS: Settings = {
   paymentMethod: "paynow",
   dataDir: DEFAULT_DATA_DIR,
   sessionFile: path.join(DEFAULT_DATA_DIR, "session.json"),
+  userDataDir: path.join(DEFAULT_DATA_DIR, "profile"),
   dryRun: true,       // Safe default — must explicitly set false to enable purchases
   logDir: path.join(DEFAULT_DATA_DIR, "logs"),
   approvalMethod: "stdin", // Safe default — terminal-based approval
@@ -262,6 +263,7 @@ function validateSettings(raw: Record<string, unknown>): Settings {
   const merged: Settings = {
     ...DEFAULTS,
     sessionFile: path.join(dataDir, "session.json"),
+    userDataDir: path.join(dataDir, "profile"),
     logDir: path.join(dataDir, "logs"),
     ...raw,
   } as Settings;
@@ -285,6 +287,9 @@ function validateSettings(raw: Record<string, unknown>): Settings {
   }
   if (typeof merged.dryRun !== "boolean") {
     throw new ConfigValidationError("settings.dryRun must be a boolean");
+  }
+  if (typeof merged.userDataDir !== "string" || merged.userDataDir.trim() === "") {
+    throw new ConfigValidationError("settings.userDataDir must be a non-empty string");
   }
   if (merged.approvalMethod !== "stdin" && merged.approvalMethod !== "telegram") {
     throw new ConfigValidationError(

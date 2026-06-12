@@ -14,7 +14,7 @@ import { loadCredentials } from "./config";
 import { isChallengeUrl } from "./decision";
 import { SELECTORS } from "./selectors";
 import { resolveSelector } from "./selectors";
-import { fillInput, clickElement, waitForUrl } from "./browser-actions";
+import { fillInputHumanlike, clickElement, waitForUrl } from "./browser-actions";
 import { captureNamedSnapshot } from "./diagnostics";
 
 const MODULE = "auth";
@@ -124,15 +124,62 @@ export async function isLoggedIn(page: Page, logger: Logger): Promise<boolean> {
   } else if (loggedInMarker) {
     loggedIn = true;
   } else {
-    // Neither matched. Fail toward logged-out so we attempt a fresh login rather
-    // than proceeding on a possibly-dead session — the old false-positive bug,
-    // where a stale login-link selector silently reported "logged in".
-    logger.warn(MODULE, "login_state_ambiguous_assuming_logged_out", { url: page.url() });
-    loggedIn = false;
+    // Neither matched — genuinely ambiguous. Before concluding logged-out (which
+    // forces a fresh login, the exact event that risks an MF01 challenge), give
+    // the header one more chance: a transient slow render or proxy hiccup
+    // shouldn't cost a re-login. This is strictly additive — it still requires a
+    // POSITIVE loggedIn marker to return true, so it can't resurrect the old
+    // false-positive where absence of a login link was read as "logged in".
+    const retry = await recheckLoginMarkers(page, logger);
+    if (retry === "logged_in") {
+      loggedIn = true;
+    } else if (retry === "logged_out") {
+      loggedIn = false;
+    } else {
+      // Still ambiguous after the retry. Fail toward logged-out so we attempt a
+      // fresh login rather than proceeding on a possibly-dead session.
+      logger.warn(MODULE, "login_state_ambiguous_assuming_logged_out", { url: page.url() });
+      loggedIn = false;
+    }
   }
 
   logger.info(MODULE, "login_state_check", { loggedIn, loggedInMarker, loginMarker });
   return loggedIn;
+}
+
+/**
+ * One extra pass at the header markers after a short settle, used only when the
+ * first check was ambiguous (neither marker visible). Returns "logged_in" only on
+ * a positive account marker, "logged_out" on a positive login link, or
+ * "ambiguous" if still neither — never infers state from absence.
+ */
+async function recheckLoginMarkers(
+  page: Page,
+  logger: Logger
+): Promise<"logged_in" | "logged_out" | "ambiguous"> {
+  await page.waitForTimeout(1_000);
+  await page
+    .locator(
+      [
+        ...SELECTORS.login.loggedInIndicator.candidates,
+        ...SELECTORS.login.loginLink.candidates,
+      ].join(", ")
+    )
+    .first()
+    .waitFor({ state: "visible", timeout: 4_000 })
+    .catch(() => {});
+
+  const loggedInMarker = await resolveSelector(page, SELECTORS.login.loggedInIndicator, 2_000)
+    .then((r) => r !== null)
+    .catch(() => false);
+  const loginMarker = await resolveSelector(page, SELECTORS.login.loginLink, 2_000)
+    .then((r) => r !== null)
+    .catch(() => false);
+
+  logger.info(MODULE, "login_state_recheck", { loggedInMarker, loginMarker });
+  if (loginMarker) return "logged_out";
+  if (loggedInMarker) return "logged_in";
+  return "ambiguous";
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +193,12 @@ export async function isLoggedIn(page: Page, logger: Logger): Promise<boolean> {
 export interface AuthDebugOptions {
   snapshotDir: string;
   pauseMs: number;
+}
+
+/** Randomized pause (ms) to make the login cadence look human. Non-crypto jitter. */
+async function humanPause(page: Page, minMs: number, maxMs: number): Promise<void> {
+  const ms = minMs + Math.floor(Math.random() * Math.max(0, maxMs - minMs));
+  await page.waitForTimeout(ms);
 }
 
 /** Logs a named login step and, in debug mode, snapshots the page + pauses. */
@@ -188,21 +241,27 @@ export async function login(
   const emailTab = await resolveSelector(page, SELECTORS.login.emailLoginTab, 3_000);
   if (emailTab) {
     await page.locator(emailTab.selector).first().click();
-    await page.waitForTimeout(500);
+    await humanPause(page, 400, 900);
     await authStep(page, "02-email-tab-selected", logger, debug);
   }
 
-  await fillInput(page, SELECTORS.login.emailInput, credentials.email, logger);
+  // Human-like pacing: type the credentials key-by-key with randomized pauses
+  // between fields. A login submitted in well under a second is itself a bot tell
+  // that raises the post-login security-challenge (MF01) odds.
+  await fillInputHumanlike(page, SELECTORS.login.emailInput, credentials.email, logger);
   logger.info(MODULE, "email_filled"); // value never logged
   await authStep(page, "03-email-filled", logger, debug);
+  await humanPause(page, 300, 800);
 
-  await fillInput(page, SELECTORS.login.passwordInput, credentials.password, logger);
+  await fillInputHumanlike(page, SELECTORS.login.passwordInput, credentials.password, logger);
   logger.info(MODULE, "password_filled"); // value never logged
   await authStep(page, "04-password-filled", logger, debug);
 
   // Overwrite credential references immediately
   (credentials as { email: string; password: string }).password = "";
 
+  // Settle before submit, as a human would after typing a password.
+  await humanPause(page, 600, 1_200);
   await clickElement(page, SELECTORS.login.submitButton, logger);
 
   logger.info(MODULE, "login_submitted");
@@ -252,7 +311,10 @@ export async function runAuthDebug(
 ): Promise<boolean> {
   logger.info(MODULE, "auth_debug_start", { loginUrl, snapshotDir, pauseMs });
 
-  // Force a clean logged-out state so the whole login is observable.
+  // Force a logged-out state so the whole login is observable. This clears the
+  // cookie-based session (enough to log out); the persistent profile's
+  // device-trust localStorage is intentionally kept, so the observed login is a
+  // normal verified-device login rather than a brand-new-device one.
   await context.clearCookies();
   logger.info(MODULE, "auth_debug_cookies_cleared");
 

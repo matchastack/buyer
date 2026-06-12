@@ -62,6 +62,7 @@ export interface Settings {
   paymentMethod: PaymentMethodKey; // Payment method to select at checkout
   dataDir: string;               // Root directory for all runtime artifacts (session, logs)
   sessionFile: string;           // Path for persisted browser cookies (default: <dataDir>/session.json)
+  userDataDir: string;           // Persistent Chromium profile dir (default: <dataDir>/profile) — carries localStorage/IndexedDB/device-trust tokens across runs so a verified device stays verified
   dryRun: boolean;               // true = monitor only, NEVER purchase
   logDir: string;                // Directory for audit log files (default: <dataDir>/logs)
   approvalMethod: ApprovalMethod; // How to gate purchases: terminal stdin or Telegram bot
