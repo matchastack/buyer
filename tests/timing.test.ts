@@ -41,4 +41,26 @@ describe("PhaseTimer", () => {
     expect(timer.summary().phasesMs["x"]).toBeGreaterThanOrEqual(0);
     expect(timer.totalMs()).toBeGreaterThanOrEqual(0);
   });
+
+  it("markAt records the delta from the previous mark up to an absolute time", () => {
+    // construct reads 1000; markAt uses the passed absolute time, not the clock
+    const timer = new PhaseTimer(fakeClock([1000]));
+    timer.markAt("buy_now_to_checkout", 1640); // 1640 - 1000 = 640
+    // payment confirmed before the CTA was even seen → overlapped, residual 0
+    timer.markAt("select_payment", 1640); // 1640 - 1640 = 0
+    expect(timer.summary().phasesMs).toEqual({ buy_now_to_checkout: 640, select_payment: 0 });
+  });
+
+  it("a later mark measures from the time markAt set, and a residual phase shows through", () => {
+    // construct 1000; the final relative mark reads 1900
+    const timer = new PhaseTimer(fakeClock([1000, 1900]));
+    timer.markAt("buy_now_to_checkout", 1640); // 640
+    timer.markAt("select_payment", 1700); // 1700 - 1640 = 60 (payment was the residual bottleneck)
+    timer.mark("place_order_to_confirm"); // clock reads 1900; 1900 - 1700 = 200
+    expect(timer.summary().phasesMs).toEqual({
+      buy_now_to_checkout: 640,
+      select_payment: 60,
+      place_order_to_confirm: 200,
+    });
+  });
 });
