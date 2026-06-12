@@ -159,6 +159,11 @@ async function runItemWorker(
         error: checkoutResult.error,
       });
     }
+
+    // Let the fire-and-forget success snapshot finish writing before the page
+    // closes below, so the order-confirmed/QR audit capture isn't truncated
+    // (monitor mode closes the page on return; no-op on failure paths).
+    await checkoutResult.pendingSnapshot?.catch(() => {});
   } finally {
     await page.close().catch(() => {});
   }
@@ -224,6 +229,10 @@ async function runBuyerWorker(
         reloadMs,
         orderNumber: checkoutResult.orderNumber,
       });
+
+      // The page stays open on the QR after the buy, so let the audit snapshot
+      // finish in the background instead of blocking this worker's return.
+      void checkoutResult.pendingSnapshot;
 
       if (checkoutResult.success) {
         runtimeStatus.totalPurchases++;

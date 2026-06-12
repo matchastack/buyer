@@ -122,6 +122,11 @@ export interface CheckoutResult {
   success: boolean;
   orderNumber: string | null;
   error: string | null;
+  // In-flight, fire-and-forget success-snapshot write (the order-confirmed /
+  // PayNow-QR audit capture). Kept off the success critical path so the buy
+  // returns the instant the outcome is detected; callers await this before any
+  // page.close() so the capture isn't truncated. Absent on failure paths.
+  pendingSnapshot?: Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
