@@ -44,6 +44,12 @@ export interface Item {
   quantity: number;  // Units to purchase (1–10)
 }
 
+export interface ProxySettings {
+  server: string;   // Proxy gateway as "host:port" (e.g. "gate.decodo.com:7000").
+                    // Credentials come from PROXY_USERNAME / PROXY_PASSWORD env vars.
+  bypass?: string;  // Optional comma-separated hosts that skip the proxy
+}
+
 export interface Settings {
   checkIntervalMs: number;       // Base poll interval per item (ms)
   pollSettleMs: number;          // Max wait for the page to render before evaluating a check (ms); adaptive, returns early
@@ -75,6 +81,8 @@ export interface Settings {
   challengeBackoffMaxMs: number;  // cap for monitoring-phase challenge backoff (ms)
   maxConsecutiveChallenges: number; // circuit breaker: give up after this many challenges with no successful check between
   workerStartDelayMs: number;     // Extra delay multiplied by worker index before first navigation (ms)
+  blockHeavyAssets: boolean;      // true = abort image/media/font requests (cuts proxy bandwidth + speeds polls)
+  proxy?: ProxySettings;          // Optional residential proxy; creds via PROXY_USERNAME/PROXY_PASSWORD env vars
 }
 
 // Options controlling how the monitor reacts to anti-bot challenges.

@@ -8,7 +8,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import { Config, Item, Settings } from "./types";
+import { Config, Item, ProxySettings, Settings } from "./types";
 import { extractProductId } from "./decision";
 
 // ---------------------------------------------------------------------------
@@ -41,6 +41,49 @@ export function loadCredentials(): Credentials {
   }
 
   return { email: email!, password: password! };
+}
+
+export interface ProxyCredentials {
+  server: string;   // host:port — non-secret, may come from config or env
+  username: string; // secret — env only
+  password: string; // secret — env only
+}
+
+/**
+ * Resolves proxy settings from env vars (and an optional config-supplied server).
+ *
+ * Proxy is entirely OPTIONAL:
+ *   - If none of server/username/password are set, returns null (run proxy-less).
+ *   - If ANY are set, ALL three are required (fail fast — a half-configured
+ *     proxy silently leaking your real IP is worse than no proxy).
+ *
+ * Username/password are env-only (PROXY_USERNAME / PROXY_PASSWORD), never in
+ * config.json — same invariant as the Lazada credentials. The server (host:port)
+ * is non-secret: it may come from settings.proxy.server or PROXY_SERVER.
+ */
+export function loadProxyCredentials(serverFromConfig?: string): ProxyCredentials | null {
+  const server = serverFromConfig?.trim() || process.env["PROXY_SERVER"]?.trim();
+  const username = process.env["PROXY_USERNAME"]?.trim();
+  const password = process.env["PROXY_PASSWORD"]?.trim();
+
+  if (!server && !username && !password) {
+    return null; // proxy disabled
+  }
+
+  const missing: string[] = [];
+  if (!server) missing.push("PROXY_SERVER (or settings.proxy.server)");
+  if (!username) missing.push("PROXY_USERNAME");
+  if (!password) missing.push("PROXY_PASSWORD");
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Proxy is partially configured — missing: ${missing.join(", ")}.\n` +
+      "Set all three (PROXY_SERVER/PROXY_USERNAME/PROXY_PASSWORD in .env), " +
+      "or none to run without a proxy."
+    );
+  }
+
+  return { server: server!, username: username!, password: password! };
 }
 
 export function loadTelegramCredentials(): TelegramCredentials {
@@ -102,6 +145,7 @@ const DEFAULTS: Settings = {
   buyRetryBaseMs: 400,             // Sub-second backoff so retries fit the drop window
   buyRetryMaxMs: 2_000,
   workerStartDelayMs: 0,  // 0 = no stagger; set to e.g. 5000 to stagger worker startup
+  blockHeavyAssets: true, // Abort image/media/font requests to cut proxy bandwidth + speed polls
 };
 
 // ---------------------------------------------------------------------------
@@ -153,8 +197,46 @@ function validateItem(item: unknown, index: number): Item {
   };
 }
 
+function validateProxy(raw: unknown): ProxySettings | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null) {
+    throw new ConfigValidationError("settings.proxy must be an object");
+  }
+  const obj = raw as Record<string, unknown>;
+
+  // Credentials are env-only — reject them here, same as the top-level invariant.
+  if ("username" in obj || "password" in obj || "user" in obj || "pass" in obj) {
+    throw new ConfigValidationError(
+      "Proxy credentials must not be stored in config.json. " +
+      "Use the PROXY_USERNAME and PROXY_PASSWORD environment variables."
+    );
+  }
+
+  const ALLOWED_PROXY_KEYS = new Set(["server", "bypass"]);
+  for (const key of Object.keys(obj)) {
+    if (!ALLOWED_PROXY_KEYS.has(key)) {
+      throw new ConfigValidationError(`settings.proxy has unknown key "${key}"`);
+    }
+  }
+
+  if (typeof obj["server"] !== "string" || obj["server"].trim() === "") {
+    throw new ConfigValidationError(
+      'settings.proxy.server must be a non-empty "host:port" string'
+    );
+  }
+  if (obj["bypass"] !== undefined && typeof obj["bypass"] !== "string") {
+    throw new ConfigValidationError("settings.proxy.bypass must be a string when present");
+  }
+
+  return {
+    server: (obj["server"] as string).trim(),
+    ...(obj["bypass"] !== undefined ? { bypass: obj["bypass"] as string } : {}),
+  };
+}
+
 function validateSettings(raw: Record<string, unknown>): Settings {
-  const ALLOWED_SETTING_KEYS = new Set(Object.keys(DEFAULTS));
+  // proxy is an optional, nested key — allowed alongside the flat DEFAULTS keys.
+  const ALLOWED_SETTING_KEYS = new Set([...Object.keys(DEFAULTS), "proxy"]);
 
   for (const key of Object.keys(raw)) {
     if (!ALLOWED_SETTING_KEYS.has(key)) {
@@ -207,6 +289,12 @@ function validateSettings(raw: Record<string, unknown>): Settings {
   if (typeof merged.debugSnapshots !== "boolean") {
     throw new ConfigValidationError("settings.debugSnapshots must be a boolean");
   }
+  if (typeof merged.blockHeavyAssets !== "boolean") {
+    throw new ConfigValidationError("settings.blockHeavyAssets must be a boolean");
+  }
+  const proxy = validateProxy(raw["proxy"]);
+  if (proxy) merged.proxy = proxy;
+  else delete merged.proxy;
   if (typeof merged.stealth !== "boolean") {
     throw new ConfigValidationError("settings.stealth must be a boolean");
   }

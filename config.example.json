@@ -42,6 +42,7 @@
     "buyMaxRetries": 5,
     "buyRetryBaseMs": 400,
     "buyRetryMaxMs": 2000,
-    "workerStartDelayMs": 5000
+    "workerStartDelayMs": 5000,
+    "blockHeavyAssets": true
   }
 }

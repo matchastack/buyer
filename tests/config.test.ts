@@ -6,12 +6,14 @@ import * as os from "os";
 // We test the exported functions directly — import after env manipulation
 let loadConfig: typeof import("../src/config").loadConfig;
 let loadCredentials: typeof import("../src/config").loadCredentials;
+let loadProxyCredentials: typeof import("../src/config").loadProxyCredentials;
 
 async function freshImport() {
   vi.resetModules();
   const mod = await import("../src/config");
   loadConfig = mod.loadConfig;
   loadCredentials = mod.loadCredentials;
+  loadProxyCredentials = mod.loadProxyCredentials;
 }
 
 describe("loadCredentials", () => {
@@ -63,6 +65,69 @@ describe("loadCredentials", () => {
     const creds = loadCredentials();
     expect(creds.email).toBe("user@example.com");
     expect(creds.password).toBe("secret");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadProxyCredentials
+// ---------------------------------------------------------------------------
+
+describe("loadProxyCredentials", () => {
+  const KEYS = ["PROXY_SERVER", "PROXY_USERNAME", "PROXY_PASSWORD"] as const;
+  const ORIG: Record<string, string | undefined> = {};
+
+  beforeEach(async () => {
+    for (const k of KEYS) {
+      ORIG[k] = process.env[k];
+      delete process.env[k];
+    }
+    await freshImport();
+  });
+
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (ORIG[k] !== undefined) process.env[k] = ORIG[k];
+      else delete process.env[k];
+    }
+  });
+
+  it("returns null when nothing is configured", () => {
+    expect(loadProxyCredentials()).toBeNull();
+    expect(loadProxyCredentials("")).toBeNull();
+  });
+
+  it("returns credentials when server (from config) + env creds are set", () => {
+    process.env["PROXY_USERNAME"] = "user-abc-country-sg";
+    process.env["PROXY_PASSWORD"] = "secret";
+    const creds = loadProxyCredentials("gate.decodo.com:7000");
+    expect(creds).toEqual({
+      server: "gate.decodo.com:7000",
+      username: "user-abc-country-sg",
+      password: "secret",
+    });
+  });
+
+  it("accepts the server from the PROXY_SERVER env var", () => {
+    process.env["PROXY_SERVER"] = "gate.decodo.com:7000";
+    process.env["PROXY_USERNAME"] = "u";
+    process.env["PROXY_PASSWORD"] = "p";
+    expect(loadProxyCredentials()?.server).toBe("gate.decodo.com:7000");
+  });
+
+  it("prefers the config-supplied server over PROXY_SERVER", () => {
+    process.env["PROXY_SERVER"] = "env.example:1000";
+    process.env["PROXY_USERNAME"] = "u";
+    process.env["PROXY_PASSWORD"] = "p";
+    expect(loadProxyCredentials("cfg.example:7000")?.server).toBe("cfg.example:7000");
+  });
+
+  it("throws when only the username is set (partial config)", () => {
+    process.env["PROXY_USERNAME"] = "u";
+    expect(() => loadProxyCredentials()).toThrow(/PROXY_SERVER|PROXY_PASSWORD/);
+  });
+
+  it("throws when server is set but credentials are missing", () => {
+    expect(() => loadProxyCredentials("gate.decodo.com:7000")).toThrow(/PROXY_USERNAME/);
   });
 });
 
@@ -293,5 +358,70 @@ describe("loadConfig", () => {
     const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, healthPort: 8080.5 } };
     const file = writeTmpConfig(bad);
     expect(() => loadConfig(file)).toThrow(/healthPort/i);
+  });
+
+  it("defaults blockHeavyAssets to true when not specified", () => {
+    const file = writeTmpConfig(VALID_CONFIG);
+    const config = loadConfig(file);
+    expect(config.settings.blockHeavyAssets).toBe(true);
+  });
+
+  it("throws when blockHeavyAssets is not a boolean", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, blockHeavyAssets: "yes" } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/blockHeavyAssets/i);
+  });
+
+  it("leaves proxy undefined when not specified", () => {
+    const file = writeTmpConfig(VALID_CONFIG);
+    const config = loadConfig(file);
+    expect(config.settings.proxy).toBeUndefined();
+  });
+
+  it("accepts a valid proxy block", () => {
+    const cfg = {
+      ...VALID_CONFIG,
+      settings: { ...VALID_CONFIG.settings, proxy: { server: "gate.decodo.com:7000" } },
+    };
+    const file = writeTmpConfig(cfg);
+    const config = loadConfig(file);
+    expect(config.settings.proxy).toEqual({ server: "gate.decodo.com:7000" });
+  });
+
+  it("accepts a proxy block with a bypass list", () => {
+    const cfg = {
+      ...VALID_CONFIG,
+      settings: { ...VALID_CONFIG.settings, proxy: { server: "h:7000", bypass: "*.lazada.sg" } },
+    };
+    const file = writeTmpConfig(cfg);
+    const config = loadConfig(file);
+    expect(config.settings.proxy).toEqual({ server: "h:7000", bypass: "*.lazada.sg" });
+  });
+
+  it("throws when proxy.server is missing or empty", () => {
+    const bad = { ...VALID_CONFIG, settings: { ...VALID_CONFIG.settings, proxy: { server: "" } } };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/proxy\.server/i);
+  });
+
+  it("throws on an unknown key inside proxy", () => {
+    const bad = {
+      ...VALID_CONFIG,
+      settings: { ...VALID_CONFIG.settings, proxy: { server: "h:7000", port: 7000 } },
+    };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/proxy has unknown key/i);
+  });
+
+  it("rejects proxy credentials stored in config.json", () => {
+    const bad = {
+      ...VALID_CONFIG,
+      settings: {
+        ...VALID_CONFIG.settings,
+        proxy: { server: "h:7000", username: "u", password: "p" },
+      },
+    };
+    const file = writeTmpConfig(bad);
+    expect(() => loadConfig(file)).toThrow(/Proxy credentials must not be stored/i);
   });
 });
